@@ -42,6 +42,7 @@ class MainActivity : AppCompatActivity() {
         Logs,
         Me,
         Alerts,
+        Settings,
         ChildMode,
     }
 
@@ -95,7 +96,10 @@ class MainActivity : AppCompatActivity() {
     private var consentChecked = true
     private var remindersOn = true
     private var skinReminderOn = true
+    private var bluetoothConnected = true
+    private var selectedLanguageIndex = 0
     private val child = ChildProfile()
+    private val languages = listOf("中文", "英文", "日语", "韩语", "西班牙语", "法语", "德语")
     private val disclaimer =
         "本回答仅供健康科普与参考，不替代医生的诊断与医嘱；如有疑虑请及时咨询主治医生或支具师。"
     private val emergencyKeywords =
@@ -106,7 +110,7 @@ class MainActivity : AppCompatActivity() {
             ChatMessage.Ai(
                 AiReply(
                     summary = "少戴会影响矫正效果，建议尽量补足医嘱时长",
-                    analysis = "朵朵近7天平均17.2小时，医嘱20小时，主要缺口在14-17点和睡前。佩戴时间越接近医嘱，越有利于维持矫正效果。",
+                    analysis = "朵朵近35天平均17.5小时，近7天平均16.8小时，医嘱20小时；6月5日至9日连续严重不足，主要缺口在14-17点和睡前。佩戴时间越接近医嘱，越有利于维持矫正效果。",
                     advice = listOf("下午14点设一次佩戴提醒", "放学后先穿戴再写作业", "睡前检查支具是否压迫皮肤"),
                     needDoctor = false,
                     doctorReason = "",
@@ -334,6 +338,7 @@ class MainActivity : AppCompatActivity() {
                                 MainTab.Logs -> addLogsPage()
                                 MainTab.Me -> addMePage()
                                 MainTab.Alerts -> addAlertsPage()
+                                MainTab.Settings -> addSettingsPage()
                                 MainTab.ChildMode -> Unit
                             }
                         },
@@ -342,7 +347,7 @@ class MainActivity : AppCompatActivity() {
                 },
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
             )
-            if (currentTab != MainTab.Alerts) {
+            if (currentTab != MainTab.Alerts && currentTab != MainTab.Settings) {
                 addView(bottomNavigation(), matchHeightLp(dp(76)))
             }
         }
@@ -350,26 +355,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun LinearLayout.addHomePage() {
-        addView(appHeader(child.nickname, "首页 · Spinecare Mom", showBell = true))
-        addView(alertBanner("连续5天佩戴不足", "低于医嘱60%，点击查看处置建议", P.danger) {
+        addView(appHeader(child.nickname, "首页 · Spinecare Mom", showBell = true, showSettings = true))
+        addView(alertBanner("6月5-9日连续严重不足", "连续5天低于医嘱60%，点击查看处置建议", P.danger) {
             currentTab = MainTab.Alerts
             render()
         })
         addSpace(12)
         addView(
             card {
-                addView(cardHeader("本周佩戴", "平均 17.2/20 h · 有数据7天", chip("达标率 86%", P.warning)))
+                addView(cardHeader("近7天佩戴", "平均 16.8/20 h · 有数据7天", chip("达标率 43%", P.warning)))
                 addView(
                     horizontal {
                         gravity = Gravity.CENTER_VERTICAL
-                        addView(ProgressRingView(this@MainActivity, 86, "达标率"), squareLp(dp(118)))
+                        addView(ProgressRingView(this@MainActivity, 43, "达标率"), squareLp(dp(118)))
                         addSpace(14, horizontal = true)
                         addView(
                             vertical {
-                                addView(rowText("目标完成", "17.2h"))
-                                addView(progressLine(86))
+                                addView(rowText("目标完成", "16.8h"))
+                                addView(progressLine(84))
                                 addSpace(12)
-                                addView(metricGrid(listOf("4天" to "最长连续达标", "+1.5h" to "较上周", "2段" to "主要缺口")))
+                                addView(metricGrid(listOf("3天" to "最长连续达标", "+0.3h" to "较上周", "35天" to "云端样本")))
                             },
                             weightLp(1f),
                         )
@@ -380,18 +385,18 @@ class MainActivity : AppCompatActivity() {
         addSpace(12)
         addView(
             card {
-                addView(cardHeader("本月趋势", "平均17.1h · 达标22/30天", chip("向好", P.success)))
-                addView(BarChartView(this@MainActivity, listOf(58, 72, 86, 64, 91, 95, 88, 76, 82, 94, 63, 79, 96, 90, 85)), matchHeightLp(dp(150)))
+                addView(cardHeader("近35天趋势", "平均17.5h · 达标16/35天", chip("含异常", P.warning)))
+                addView(BarChartView(this@MainActivity, listOf(100, 100, 96, 100, 87, 100, 0, 94, 100, 100, 76, 81, 99, 100, 100, 63, 74, 90, 100, 100, 98, 100, 100, 100, 93, 49, 53, 57, 43, 59, 82, 94, 100, 100, 100)), matchHeightLp(dp(150)))
             },
         )
         addSpace(12)
         addView(
             card {
                 addView(cardHeader("智能解读", null, chip("AI", P.primary)))
-                addInsight("缺口时段集中在14-17点和21-22点。")
-                addInsight("比上周平均多1.5小时，节奏正在恢复。")
-                addInsight("下午放学后增加一次佩戴提醒，睡前保留皮肤检查。")
-                addInsight("今天先把最容易做到的一段补回来，不需要一次解决全部问题。")
+                addInsight("云端已有35天佩戴记录，覆盖达标、轻度不足、设备未佩戴和连续严重不足。")
+                addInsight("主要缺口集中在21-22点，其次为14-17点。")
+                addInsight("6月5日至9日触发红色佩戴预警，6月12日后连续3天恢复达标。")
+                addInsight("皮肤破损和身高增长1.3cm已进入复诊报告。")
             },
         )
         addSpace(12)
@@ -406,8 +411,8 @@ class MainActivity : AppCompatActivity() {
         addSpace(12)
         addView(
             card {
-                addView(cardHeader("历史趋势", "近90天", null))
-                addView(metricGrid(listOf("16.8h" to "历史日均", "71%" to "总体达标率", "12天" to "最长连续")))
+                addView(cardHeader("历史趋势", "云端调试数据", null))
+                addView(metricGrid(listOf("17.5h" to "35天日均", "46%" to "总体达标率", "3天" to "最长连续")))
             },
         )
     }
@@ -416,7 +421,7 @@ class MainActivity : AppCompatActivity() {
         addView(appHeader("咨询", "当前：${child.nickname}(已关联档案)", showBell = true))
         addView(
             card {
-                addView(cardHeader("常见问题", "近7天数据已注入", chip("个性化", P.success)))
+                addView(cardHeader("常见问题", "近35天云端数据已注入", chip("个性化", P.success)))
                 addView(
                     grid(2) {
                         listOf("少戴2h有影响吗", "皮肤红了怎么办", "能上体育课吗", "被同学笑话怎么办").forEach { question ->
@@ -479,20 +484,20 @@ class MainActivity : AppCompatActivity() {
         addView(
             card {
                 addView(cardHeader("依从性报告", "每周一与每月1日自动生成", chip("生成", P.primary)))
-                addView(reportRow("周报 · 6月8日-6月14日", "达标率86% · 缺口14-17点", "已生成", P.success))
+                addView(reportRow("周报 · 6月8日-6月14日", "达标率43% · 缺口21-22点", "需关注", P.warning))
                 addSpace(8)
-                addView(reportRow("月报 · 2026年6月", "平均17.1h · 达标22/30天", "需关注", P.warning))
+                addView(reportRow("35天报告 · 5月11日-6月14日", "平均17.5h · 达标16/35天", "已生成", P.success))
                 addSpace(8)
-                addView(reportRow("周报 · 6月1日-6月7日", "达标率71% · 较前周+1.5h", "已生成", P.success))
+                addView(reportRow("异常报告 · 6月5日-6月9日", "连续5天低于医嘱60%", "红色", P.danger))
             },
         )
         addSpace(12)
         addView(
             card {
                 addView(cardHeader("本周摘要", null, chip("AI", P.primary)))
-                addInsight("本周佩戴节奏较上周改善，达标天数增加。")
-                addInsight("主要缺口仍在下午放学后，需要更稳定的提醒。")
-                addInsight("左腰部发红需继续观察，建议记录照片变化。")
+                addInsight("近7天平均16.8h，较前7天+0.3h，恢复趋势刚开始。")
+                addInsight("连续严重不足后已恢复3天达标，仍需关注晚间缺口。")
+                addInsight("左腰部破皮/水泡和身高增长已进入复诊问题清单。")
             },
         )
     }
@@ -500,7 +505,7 @@ class MainActivity : AppCompatActivity() {
     private fun LinearLayout.addVisitReport() {
         addView(
             card {
-                addView(cardHeader("复诊报告预览", "周期：近30天", chip("二维码", P.primary)))
+                addView(cardHeader("复诊报告预览", "周期：近35天", chip("二维码", P.primary)))
                 addView(
                     vertical {
                         background = rounded(P.surface, dp(8), P.line)
@@ -508,10 +513,10 @@ class MainActivity : AppCompatActivity() {
                         addView(label("Spinecare Mom 复诊报告", 17f, P.text, Typeface.BOLD, Gravity.CENTER))
                         addSpace(10)
                         addPaperRow("基本信息", "朵朵，12岁，胸腰弯，初始Cobb 25°，Risser 2。")
-                        addPaperRow("佩戴摘要", "近30天平均17.1h/天，达标22天，统计30天。")
-                        addView(BarChartView(this@MainActivity, listOf(62, 74, 84, 68, 91, 88, 93, 77, 82, 90)), matchHeightLp(dp(78)))
-                        addPaperRow("缺口时段", "14:00-17:00、21:00-22:00。")
-                        addPaperRow("皮肤与生长", "左腰部连续发红2天；近1个月身高+1.2cm。")
+                        addPaperRow("佩戴摘要", "近35天平均17.5h/天，达标16天，统计35天。")
+                        addView(BarChartView(this@MainActivity, listOf(100, 100, 96, 100, 87, 100, 0, 94, 100, 100, 76, 81, 99, 100, 100, 63, 74, 90, 100, 100, 98, 100, 100, 100, 93, 49, 53, 57, 43, 59, 82, 94, 100, 100, 100)), matchHeightLp(dp(78)))
+                        addPaperRow("缺口时段", "21:00-22:00、14:00-17:00。")
+                        addPaperRow("皮肤与生长", "6月6-7日破皮/水泡；近1个月身高+1.3cm。")
                         addPaperRow("医生填写区", "______________________________")
                     },
                 )
@@ -531,11 +536,11 @@ class MainActivity : AppCompatActivity() {
         addView(
             card {
                 addView(cardHeader("2026年6月", "按月筛选", chip("筛选", P.primary)))
-                addView(reportRow("周报 · 6月8日-6月14日", "已存档 · 医生可查看", "已生成", P.success))
+                addView(reportRow("周报 · 6月8日-6月14日", "已存档 · 医生可查看", "需关注", P.warning))
                 addSpace(8)
-                addView(reportRow("周报 · 6月1日-6月7日", "已存档 · 医生可查看", "已生成", P.success))
+                addView(reportRow("35天报告 · 5月11日-6月14日", "已存档 · 医生可查看", "已生成", P.success))
                 addSpace(8)
-                addView(reportRow("月报 · 2026年5月", "已存档 · 医生可查看", "已生成", P.success))
+                addView(reportRow("异常报告 · 6月5日-6月9日", "已存档 · 医生可查看", "红色", P.danger))
             },
         )
     }
@@ -606,10 +611,10 @@ class MainActivity : AppCompatActivity() {
     private fun LinearLayout.addGrowthLog() {
         addView(
             card {
-                addView(cardHeader("生长记录", "本月身高 +1.2cm", chip("需关注", P.warning)))
+                addView(cardHeader("生长记录", "本月身高 +1.3cm", chip("需关注", P.warning)))
                 addView(
                     horizontal {
-                        addView(field("身高(cm)", "154.2", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL), weightLp(1f))
+                        addView(field("身高(cm)", "154.3", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL), weightLp(1f))
                         addSpace(10, horizontal = true)
                         addView(primaryButton("录入") {}, widthLp(dp(82)))
                     },
@@ -660,6 +665,8 @@ class MainActivity : AppCompatActivity() {
             card {
                 addView(settingRow("设备管理", "SpineSensor-A12 · 电量82% · 今天08:12同步", "正常"))
                 addSpace(8)
+                addView(settingRow("服务接口", ApiConfig.baseUrl, "API"))
+                addSpace(8)
                 addView(toggleRow("佩戴提醒", "14:00、21:00 两个缺口时段", remindersOn) {
                     remindersOn = !remindersOn
                     render()
@@ -708,9 +715,54 @@ class MainActivity : AppCompatActivity() {
         }, matchLp())
     }
 
+    private fun LinearLayout.addSettingsPage() {
+        addView(appHeader("设置", "蓝牙连接与语言", showBell = false, showBack = true))
+        addView(
+            card {
+                addView(
+                    cardHeader(
+                        "蓝牙连接",
+                        "用于同步佩戴时长、电量和设备状态",
+                        chip(if (bluetoothConnected) "已连接" else "未连接", if (bluetoothConnected) P.success else P.warning),
+                    ),
+                )
+                addView(
+                    toggleRow(
+                        "SpineSensor-A12",
+                        if (bluetoothConnected) "电量82% · 今天08:12同步 · 信号稳定" else "蓝牙未连接，点击重新连接",
+                        bluetoothConnected,
+                    ) {
+                        bluetoothConnected = !bluetoothConnected
+                        render()
+                    },
+                )
+                addSpace(8)
+                addView(settingRow("附近设备扫描", "SpineSensor-A12、SpineSensor-B08", "扫描") {
+                    bluetoothConnected = true
+                    render()
+                })
+                addSpace(8)
+                addView(infoStrip("真实蓝牙接入前，此处用于调试连接状态与设备同步入口。"))
+            },
+        )
+        addSpace(12)
+        addView(
+            card {
+                addView(cardHeader("语言选择", "当前：${languages[selectedLanguageIndex]}", chip("7种", P.primary)))
+                languages.forEachIndexed { index, language ->
+                    if (index > 0) addSpace(8)
+                    addView(languageRow(language, index == selectedLanguageIndex) {
+                        selectedLanguageIndex = index
+                        render()
+                    })
+                }
+            },
+        )
+    }
+
     private fun LinearLayout.addAlertsPage() {
         addView(appHeader("消息中心", "全部 / 未读", showBell = false, showBack = true))
-        addView(alertRow("红", "连续5天佩戴严重不足", "近5天低于医嘱60%，建议查看缺口并联系医生或支具师。", P.danger))
+        addView(alertRow("红", "6月5日至9日连续严重不足", "连续5天低于医嘱60%，建议查看缺口并联系医生或支具师。", P.danger))
         addSpace(8)
         addView(alertRow("黄", "左腰部连续2天发红", "请观察摩擦点，持续不适时及时咨询支具师。", P.warning))
         addSpace(8)
@@ -719,8 +771,8 @@ class MainActivity : AppCompatActivity() {
         addView(
             card {
                 addView(cardHeader("预警详情", "红色预警", chip("红色", P.danger)))
-                addInsight("触发原因：连续5天佩戴低于医嘱60%。")
-                addInsight("相关数据：近5天平均11.6h/天，目标20h/天。")
+                addInsight("触发原因：6月5日至6月9日连续5天佩戴低于医嘱60%。")
+                addInsight("相关数据：5天平均10.4h/天，目标20h/天。")
                 addInsight("建议操作：查看缺口分析；如持续困难，联系主治医生或支具师。")
                 addSpace(12)
                 addView(primaryButton("我已处理") {
@@ -752,21 +804,21 @@ class MainActivity : AppCompatActivity() {
                 vertical {
                     background = rounded(0xFF365F71.toInt(), dp(24), null)
                     setPadding(dp(22), dp(22), dp(22), dp(22))
-                    addView(chip("今日进度 82%", P.success))
+                    addView(chip("今日进度 100%", P.success))
                     addSpace(12)
-                    addView(label("朵朵，今天已经很接近目标了", 25f, Color.WHITE, Typeface.BOLD))
-                    addView(label("再完成3.6小时，就能点亮今天的进度环。", 15f, 0xFFEAF7F7.toInt()))
+                    addView(label("朵朵，今天已经恢复达标了", 25f, Color.WHITE, Typeface.BOLD))
+                    addView(label("连续3天达标，睡前再做一次皮肤检查。", 15f, 0xFFEAF7F7.toInt()))
                 },
             )
             addSpace(12)
-            addView(metricGrid(listOf("4" to "连续达标", "17.2h" to "本周日均", "86%" to "本周达标")))
+            addView(metricGrid(listOf("3" to "连续达标", "16.8h" to "本周日均", "43%" to "本周达标")))
             addSpace(12)
             addView(
                 card {
                     addView(cardHeader("阶段徽章", "本月", null))
                     addView(
                         grid(3) {
-                            listOf("稳定达人", "4天连击", "复诊准备").forEach { addQuick(it) {} }
+                            listOf("恢复达标", "3天连击", "复诊准备").forEach { addQuick(it) {} }
                         },
                     )
                 },
@@ -826,7 +878,7 @@ class MainActivity : AppCompatActivity() {
         if (question.contains("笑") || question.contains("不肯") || question.contains("焦虑")) {
             return AiReply(
                 summary = "孩子抗拒时，先降低对抗感，再把佩戴拆成可完成的小目标",
-                analysis = "朵朵近7天已有改善迹象。青春期孩子更在意自主感，直接催促容易让佩戴变成冲突。",
+                analysis = "朵朵近35天数据里出现过连续严重不足，最近3天已经恢复达标。青春期孩子更在意自主感，直接催促容易让佩戴变成冲突。",
                 advice = listOf("和孩子约定一个可选择的提醒时间", "把下午缺口拆成30分钟一段", "达标后只反馈进步，不反复追问"),
                 needDoctor = false,
                 doctorReason = "",
@@ -847,7 +899,7 @@ class MainActivity : AppCompatActivity() {
 
         return AiReply(
             summary = "可以先从最明显的缺口时段补起，不需要一次改变全部习惯",
-            analysis = "朵朵近7天平均17.2小时，距离医嘱20小时还有约2.8小时缺口，主要集中在下午和睡前。",
+            analysis = "朵朵近7天平均16.8小时，距离医嘱20小时还有约3.2小时缺口，近35天主要缺口集中在21-22点和14-17点。",
             advice = listOf("下午14点开启一次短提醒", "把放学后第一小时设为固定佩戴段", "睡前用30秒检查皮肤和支具位置"),
             needDoctor = false,
             doctorReason = "",
@@ -874,7 +926,13 @@ class MainActivity : AppCompatActivity() {
             addView(label(title, 24f, P.text, Typeface.BOLD))
         }
 
-    private fun appHeader(title: String, subtitle: String, showBell: Boolean, showBack: Boolean = false): View =
+    private fun appHeader(
+        title: String,
+        subtitle: String,
+        showBell: Boolean,
+        showBack: Boolean = false,
+        showSettings: Boolean = false,
+    ): View =
         horizontal {
             gravity = Gravity.CENTER_VERTICAL
             if (showBack) {
@@ -894,6 +952,13 @@ class MainActivity : AppCompatActivity() {
             if (showBell) {
                 addView(secondaryButton("铃") {
                     currentTab = MainTab.Alerts
+                    render()
+                }, widthHeightLp(dp(48), dp(48)))
+            }
+            if (showSettings) {
+                if (showBell) addSpace(8, horizontal = true)
+                addView(iconButton("⚙", "设置") {
+                    currentTab = MainTab.Settings
                     render()
                 }, widthHeightLp(dp(48), dp(48)))
             }
@@ -1244,6 +1309,16 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { onClick() }
         }
 
+    private fun languageRow(language: String, selected: Boolean, onClick: () -> Unit): View =
+        horizontal {
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(if (selected) adjustAlpha(P.primary, 0.08f) else P.surfaceAlt, dp(8), P.softLine)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            addView(label(language, 15f, if (selected) P.primary else P.text, Typeface.BOLD), weightLp(1f))
+            addView(chip(if (selected) "当前" else "选择", if (selected) P.success else P.primary))
+            setOnClickListener { onClick() }
+        }
+
     private fun alertRow(level: String, title: String, subtitle: String, color: Int): View =
         horizontal {
             gravity = Gravity.CENTER_VERTICAL
@@ -1307,6 +1382,18 @@ class MainActivity : AppCompatActivity() {
             this.text = text
             transformationMethod = null
             textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(P.primary)
+            background = rounded(P.primaryLight, dp(8), adjustAlpha(P.primary, 0.18f))
+            setOnClickListener { onClick() }
+        }
+
+    private fun iconButton(text: String, description: String, onClick: () -> Unit): Button =
+        Button(this).apply {
+            this.text = text
+            contentDescription = description
+            transformationMethod = null
+            textSize = 21f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(P.primary)
             background = rounded(P.primaryLight, dp(8), adjustAlpha(P.primary, 0.18f))

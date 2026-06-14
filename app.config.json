@@ -2,6 +2,8 @@
   "appName": "Spinecare Mom",
   "sourceRoot": "D:/2026/202606/SpinecareMom",
   "dependencyRoot": "D:/2026/codexwork/SpinecareMom",
+  "projectCode": "spinecaremom",
+  "apiBaseUrl": "http://152.136.62.157/spinecaremom-api",
   "vendor": {
     "lucide": "D:/2026/codexwork/SpinecareMom/vendor/lucide.js"
   }

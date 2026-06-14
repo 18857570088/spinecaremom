@@ -1,0 +1,16 @@
+[Unit]
+Description=Spinecare Mom API
+After=network.target mysql.service
+
+[Service]
+Type=simple
+User=spinecaremom
+Group=spinecaremom
+WorkingDirectory=/opt/spinecaremom-server
+EnvironmentFile=/etc/spinecaremom/spinecaremom.env
+ExecStart=/opt/spinecaremom-server/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8098 --workers 1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

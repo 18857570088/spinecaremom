@@ -13,6 +13,8 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
+        buildConfigField("String", "API_BASE_URL", "\"http://152.136.62.157/spinecaremom-api\"")
+        buildConfigField("String", "PROJECT_CODE", "\"spinecaremom\"")
     }
 
     buildTypes {
