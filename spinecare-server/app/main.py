@@ -6,9 +6,9 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .db import db_cursor, ping
@@ -40,6 +40,8 @@ EMERGENCY_KEYWORDS = [
 ]
 
 DISCLAIMER = "本回答仅供健康科普与参考，不替代医生的诊断与医嘱；如有疑虑请及时咨询主治医生或支具师。"
+DELETE_CONFIRMATION_TEXT = "删除全部数据"
+DELETE_COOLING_HOURS = 24
 
 
 class AskRequest(BaseModel):
@@ -52,12 +54,79 @@ class SkinLogRequest(BaseModel):
     region: str
     status: str
     note: str | None = None
+    photos: list[str] = Field(default_factory=list)
 
 
 class GrowthLogRequest(BaseModel):
     child_id: str = "demo-child"
     height_cm: float
     note: str | None = None
+
+
+class ImagingRequest(BaseModel):
+    child_id: str = "demo-child"
+    image_type: str = Field(default="X光", max_length=32)
+    file_url: str | None = Field(default=None, max_length=512)
+    shot_date: date
+    note: str | None = None
+
+
+class ReportArchiveRequest(BaseModel):
+    child_id: str = Field(default="demo-child", max_length=64)
+    kind: str = Field(max_length=32)
+    period_start: date | None = None
+    period_end: date | None = None
+    payload_json: dict = Field(default_factory=dict)
+    pdf_url: str | None = Field(default=None, max_length=512)
+
+
+class DeleteDataRequestCreate(BaseModel):
+    child_id: str = Field(default="demo-child", max_length=64)
+    child_nickname: str = Field(min_length=1, max_length=32)
+    backup_confirmed: bool = False
+    irreversible_confirmed: bool = False
+    current_child_confirmed: bool = False
+    confirmation_text: str = Field(min_length=1, max_length=32)
+
+
+class DeleteDataRequestExecute(BaseModel):
+    confirmation_text: str = Field(min_length=1, max_length=32)
+
+
+class ChildProfileUpsertRequest(BaseModel):
+    child_id: str = Field(default="demo-child", max_length=64)
+    phone: str | None = Field(default=None, max_length=32)
+    verification_code: str | None = Field(default=None, max_length=16)
+    login_method: str = Field(default="sms", max_length=32)
+    consent_accepted: bool = True
+    nickname: str = Field(default="朵朵", min_length=1, max_length=32)
+    gender: str = Field(default="女", max_length=16)
+    birth_date: date | None = None
+    cobb_initial: int | None = Field(default=None, ge=0, le=120)
+    curve_type: str | None = Field(default=None, max_length=32)
+    risser: str | None = Field(default=None, max_length=16)
+    prescribed_hours: float = Field(default=20.0, ge=0, le=24)
+    brace_type: str | None = Field(default=None, max_length=32)
+    first_visit_date: date | None = None
+    app_project: str | None = Field(default=None, max_length=64)
+    raw: dict = Field(default_factory=dict)
+
+
+class DeviceWearRecord(BaseModel):
+    date: date
+    worn_hours: float = Field(ge=0, le=24)
+    sample_count: int = Field(ge=0)
+    worn_count: int = Field(ge=0)
+    sample_interval_minutes: int = Field(default=10, ge=1, le=60)
+    hourly_records: list[dict] = Field(default_factory=list)
+
+
+class DeviceWearSyncRequest(BaseModel):
+    child_id: str = "demo-child"
+    device_name: str | None = None
+    device_address: str | None = None
+    records: list[DeviceWearRecord] = Field(default_factory=list)
+    raw: dict = Field(default_factory=dict)
 
 
 app = FastAPI(title=settings.app_name, version="1.1.0")
@@ -82,6 +151,117 @@ def parse_json(value):
         return None
 
 
+def ensure_children_profile_columns(cur):
+    columns = {
+        "guardian_phone": "VARCHAR(32) NULL",
+        "verification_code": "VARCHAR(16) NULL",
+        "login_method": "VARCHAR(32) NULL",
+        "consent_accepted": "BOOLEAN NOT NULL DEFAULT TRUE",
+        "source_json": "JSON NULL",
+        "last_login_at": "DATETIME NULL",
+    }
+    for name, definition in columns.items():
+        cur.execute("SHOW COLUMNS FROM children LIKE %s", (name,))
+        if cur.fetchone() is None:
+            cur.execute(f"ALTER TABLE children ADD COLUMN {name} {definition}")
+
+
+def ensure_delete_requests_table(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS delete_requests (
+            id VARCHAR(64) PRIMARY KEY,
+            child_id VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
+            backup_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+            requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            confirmed_at DATETIME NULL,
+            scheduled_delete_at DATETIME NOT NULL,
+            cancelled_at DATETIME NULL,
+            completed_at DATETIME NULL,
+            deleted_counts_json JSON NULL,
+            request_json JSON NULL,
+            INDEX idx_delete_child_status (child_id, status),
+            INDEX idx_delete_child_requested (child_id, requested_at)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """
+    )
+
+
+def upload_file_id_from_ref(ref: str | None) -> str | None:
+    if not ref:
+        return None
+    value = str(ref).strip()
+    if not value:
+        return None
+    marker = "/api/v1/uploads/"
+    if marker in value:
+        value = value.rsplit(marker, 1)[-1]
+    value = value.split("?", 1)[0].split("#", 1)[0].strip("/")
+    file_id = Path(value).name
+    if file_id != value or not file_id or len(file_id) > 220:
+        return None
+    return file_id
+
+
+def delete_upload_files(refs: list[str]) -> int:
+    upload_root = Path(settings.upload_dir).resolve()
+    deleted = 0
+    for ref in refs:
+        file_id = upload_file_id_from_ref(ref)
+        if not file_id:
+            continue
+        path = (upload_root / file_id).resolve()
+        if upload_root not in path.parents and path != upload_root:
+            continue
+        if path.is_file():
+            path.unlink()
+            deleted += 1
+    return deleted
+
+
+def collect_upload_refs_for_child(cur, child_id: str) -> list[str]:
+    refs: list[str] = []
+    cur.execute("SELECT photos_json FROM skin_logs WHERE child_id = %s", (child_id,))
+    for row in cur.fetchall():
+        photos = parse_json(row.get("photos_json")) or []
+        if isinstance(photos, list):
+            refs.extend(str(item) for item in photos if item)
+    cur.execute("SELECT file_url FROM imaging_files WHERE child_id = %s", (child_id,))
+    refs.extend(str(row["file_url"]) for row in cur.fetchall() if row.get("file_url"))
+    cur.execute("SELECT pdf_url FROM reports WHERE child_id = %s", (child_id,))
+    refs.extend(str(row["pdf_url"]) for row in cur.fetchall() if row.get("pdf_url"))
+    return refs
+
+
+def delete_child_cloud_data(cur, child_id: str) -> dict:
+    tables = [
+        "ai_messages",
+        "alerts",
+        "reports",
+        "imaging_files",
+        "growth_logs",
+        "skin_logs",
+        "wear_records",
+        "devices",
+        "children",
+    ]
+    counts: dict[str, int] = {}
+    for table in tables:
+        cur.execute(f"SELECT COUNT(*) AS count FROM {table} WHERE child_id = %s" if table != "children" else "SELECT COUNT(*) AS count FROM children WHERE id = %s", (child_id,))
+        counts[table] = int(cur.fetchone()["count"])
+    for table in tables:
+        cur.execute(f"DELETE FROM {table} WHERE child_id = %s" if table != "children" else "DELETE FROM children WHERE id = %s", (child_id,))
+    return counts
+
+
+def normalize_gender(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"男", "male", "m"}:
+        return "male"
+    return "female"
+
+
 def iso_row(row: dict) -> dict:
     result = {}
     for key, value in row.items():
@@ -104,11 +284,16 @@ def range_days(range_name: str) -> int:
     return mapping.get(range_name, 7)
 
 
-def longest_streak(rows: list[dict]) -> int:
+def longest_streak(rows: list[dict], prescribed_hours: float | None = None) -> int:
     longest = 0
     current = 0
     for row in sorted(rows, key=lambda item: item["record_date"]):
-        if row["is_compliant"]:
+        is_compliant = (
+            float(row["worn_hours"]) >= prescribed_hours
+            if prescribed_hours is not None and prescribed_hours > 0
+            else bool(row["is_compliant"])
+        )
+        if is_compliant:
             current += 1
             longest = max(longest, current)
         else:
@@ -153,6 +338,25 @@ def query_wear_rows(child_id: str, days: int) -> list[dict]:
         return cur.fetchall()
 
 
+def prescribed_hours_for_child(child_id: str) -> float:
+    with db_cursor() as cur:
+        ensure_children_profile_columns(cur)
+        cur.execute(
+            """
+            SELECT prescribed_hours
+            FROM children
+            WHERE id = %s
+            """,
+            (child_id,),
+        )
+        row = cur.fetchone()
+    if row and row.get("prescribed_hours") is not None:
+        value = round(float(row["prescribed_hours"]), 1)
+        if 0 < value <= 24:
+            return value
+    return 20.0
+
+
 @app.get("/")
 def root():
     return {
@@ -173,15 +377,99 @@ def health():
     }
 
 
+@app.post("/api/v1/children/profile")
+def upsert_child_profile(payload: ChildProfileUpsertRequest):
+    source_payload = {
+        "app_project": payload.app_project,
+        "login_method": payload.login_method,
+        "raw": payload.raw,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with db_cursor(commit=True) as cur:
+        ensure_children_profile_columns(cur)
+        cur.execute(
+            """
+            INSERT INTO children (
+                id, nickname, gender, birth_date, cobb_initial, curve_type, risser,
+                prescribed_hours, brace_type, first_visit_date, guardian_phone,
+                verification_code, login_method, consent_accepted, source_json,
+                last_login_at, created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s, CAST(%s AS JSON),
+                NOW(), NOW(), NOW()
+            )
+            ON DUPLICATE KEY UPDATE
+                nickname = VALUES(nickname),
+                gender = VALUES(gender),
+                birth_date = VALUES(birth_date),
+                cobb_initial = VALUES(cobb_initial),
+                curve_type = VALUES(curve_type),
+                risser = VALUES(risser),
+                prescribed_hours = VALUES(prescribed_hours),
+                brace_type = VALUES(brace_type),
+                first_visit_date = VALUES(first_visit_date),
+                guardian_phone = VALUES(guardian_phone),
+                verification_code = VALUES(verification_code),
+                login_method = VALUES(login_method),
+                consent_accepted = VALUES(consent_accepted),
+                source_json = VALUES(source_json),
+                last_login_at = VALUES(last_login_at),
+                updated_at = NOW()
+            """,
+            (
+                payload.child_id,
+                payload.nickname.strip(),
+                normalize_gender(payload.gender),
+                payload.birth_date,
+                payload.cobb_initial,
+                payload.curve_type,
+                payload.risser,
+                round(float(payload.prescribed_hours), 1),
+                payload.brace_type,
+                payload.first_visit_date,
+                payload.phone,
+                payload.verification_code,
+                payload.login_method,
+                payload.consent_accepted,
+                json.dumps(source_payload, ensure_ascii=False),
+            ),
+        )
+    return {"ok": True, "child_id": payload.child_id, "status": "saved"}
+
+
+@app.get("/api/v1/children/{child_id}")
+def get_child_profile(child_id: str):
+    with db_cursor(commit=True) as cur:
+        ensure_children_profile_columns(cur)
+        cur.execute(
+            """
+            SELECT id, nickname, gender, birth_date, cobb_initial, curve_type, risser,
+                   prescribed_hours, brace_type, first_visit_date, guardian_phone,
+                   verification_code, login_method, consent_accepted, source_json,
+                   last_login_at, created_at, updated_at
+            FROM children
+            WHERE id = %s
+            """,
+            (child_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return JSONResponse(status_code=404, content={"detail": "child not found"})
+    return iso_row(row)
+
+
 @app.get("/api/v1/wear/summary")
 def wear_summary(child_id: str = "demo-child", range: str = "week"):
     rows = query_wear_rows(child_id, range_days(range))
+    prescribed = prescribed_hours_for_child(child_id)
     if not rows:
         return {
             "child_id": child_id,
             "range": range,
             "avg_hours": 0,
-            "prescribed": 0,
+            "prescribed": prescribed,
             "compliance_rate": 0,
             "days_counted": 0,
             "longest_streak": 0,
@@ -190,8 +478,7 @@ def wear_summary(child_id: str = "demo-child", range: str = "week"):
         }
 
     avg_hours = round(sum(float(row["worn_hours"]) for row in rows) / len(rows), 1)
-    prescribed = round(float(rows[-1]["prescribed_hours"]), 1)
-    compliance_rate = round(sum(1 for row in rows if row["is_compliant"]) / len(rows) * 100)
+    compliance_rate = round(sum(1 for row in rows if float(row["worn_hours"]) >= prescribed) / len(rows) * 100)
     current_days = min(7, len(rows))
     previous_rows = rows[-current_days * 2 : -current_days]
     current_rows = rows[-current_days:]
@@ -208,7 +495,7 @@ def wear_summary(child_id: str = "demo-child", range: str = "week"):
         "prescribed": prescribed,
         "compliance_rate": compliance_rate,
         "days_counted": len(rows),
-        "longest_streak": longest_streak(rows),
+        "longest_streak": longest_streak(rows, prescribed),
         "gap_slots": top_gap_slots(rows),
         "trend_vs_last": round(current_avg - previous_avg, 1),
         "period_start": rows[0]["record_date"].isoformat(),
@@ -218,8 +505,74 @@ def wear_summary(child_id: str = "demo-child", range: str = "week"):
 
 @app.get("/api/v1/wear/records")
 def wear_records(child_id: str = "demo-child", days: int = 35):
-    rows = query_wear_rows(child_id, max(1, min(days, 120)))
+    rows = query_wear_rows(child_id, max(1, min(days, 3650)))
     return {"items": [iso_row(row) for row in rows]}
+
+
+@app.post("/api/v1/wear/device-sync")
+def sync_device_wear(payload: DeviceWearSyncRequest):
+    if not payload.records:
+        return {
+            "ok": True,
+            "saved": 0,
+            "message": "no records",
+        }
+    if (
+        payload.raw.get("worn_bits") == 0
+        and all(float(item.worn_hours) == 0.0 and item.worn_count == 0 for item in payload.records)
+    ):
+        return {
+            "ok": True,
+            "saved": 0,
+            "skipped": len(payload.records),
+            "message": "cleared device history ignored",
+        }
+
+    prescribed_hours = prescribed_hours_for_child(payload.child_id)
+    saved_dates: list[str] = []
+    with db_cursor(commit=True) as cur:
+        for item in payload.records:
+            worn_hours = round(float(item.worn_hours), 1)
+            intervals_payload = {
+                "source": "bluetooth_device",
+                "device_name": payload.device_name,
+                "device_address": payload.device_address,
+                "sample_count": item.sample_count,
+                "worn_count": item.worn_count,
+                "sample_interval_minutes": item.sample_interval_minutes,
+                "hourly_records": item.hourly_records,
+                "raw": payload.raw,
+            }
+            cur.execute(
+                """
+                INSERT INTO wear_records
+                    (id, child_id, record_date, worn_hours, prescribed_hours, is_compliant, intervals_json, synced_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, CAST(%s AS JSON), NOW())
+                ON DUPLICATE KEY UPDATE
+                    worn_hours = VALUES(worn_hours),
+                    prescribed_hours = VALUES(prescribed_hours),
+                    is_compliant = VALUES(is_compliant),
+                    intervals_json = VALUES(intervals_json),
+                    synced_at = VALUES(synced_at)
+                """,
+                (
+                    f"wear-device-{uuid4().hex[:16]}",
+                    payload.child_id,
+                    item.date,
+                    worn_hours,
+                    prescribed_hours,
+                    worn_hours >= prescribed_hours,
+                    json.dumps(intervals_payload, ensure_ascii=False),
+                ),
+            )
+            saved_dates.append(item.date.isoformat())
+
+    return {
+        "ok": True,
+        "saved": len(saved_dates),
+        "dates": saved_dates,
+    }
 
 
 @app.get("/api/v1/alerts")
@@ -329,6 +682,28 @@ def list_reports(child_id: str = "demo-child"):
     return {"items": [iso_row(row) for row in rows]}
 
 
+@app.post("/api/v1/reports")
+def archive_report(payload: ReportArchiveRequest):
+    item_id = str(uuid4())
+    with db_cursor(commit=True) as cur:
+        cur.execute(
+            """
+            INSERT INTO reports (id, child_id, kind, period_start, period_end, payload_json, pdf_url, created_at)
+            VALUES (%s, %s, %s, %s, %s, CAST(%s AS JSON), %s, NOW())
+            """,
+            (
+                item_id,
+                payload.child_id,
+                payload.kind,
+                payload.period_start,
+                payload.period_end,
+                json.dumps(payload.payload_json, ensure_ascii=False),
+                payload.pdf_url,
+            ),
+        )
+    return {"id": item_id, "status": "saved"}
+
+
 @app.post("/api/v1/reports/visit")
 def create_visit_report(child_id: str = "demo-child", days: int = 35):
     return {
@@ -338,6 +713,192 @@ def create_visit_report(child_id: str = "demo-child", days: int = 35):
         "qr_url": None,
         "status": "preview_ready",
     }
+
+
+@app.get("/api/v1/delete-requests/current")
+def current_delete_request(child_id: str = "demo-child"):
+    with db_cursor() as cur:
+        ensure_delete_requests_table(cur)
+        cur.execute(
+            """
+            SELECT id, child_id, status, backup_confirmed, requested_at, confirmed_at,
+                   scheduled_delete_at, cancelled_at, completed_at, deleted_counts_json
+            FROM delete_requests
+            WHERE child_id = %s
+            ORDER BY requested_at DESC
+            LIMIT 1
+            """,
+            (child_id,),
+        )
+        row = cur.fetchone()
+    return {"item": iso_row(row) if row else None}
+
+
+@app.post("/api/v1/delete-requests")
+def create_delete_request(payload: DeleteDataRequestCreate):
+    if payload.confirmation_text.strip() != DELETE_CONFIRMATION_TEXT:
+        raise HTTPException(status_code=400, detail="confirmation text mismatch")
+    if not (payload.backup_confirmed and payload.irreversible_confirmed and payload.current_child_confirmed):
+        raise HTTPException(status_code=400, detail="all confirmations are required")
+
+    with db_cursor(commit=True) as cur:
+        ensure_delete_requests_table(cur)
+        ensure_children_profile_columns(cur)
+        cur.execute("SELECT id, nickname FROM children WHERE id = %s", (payload.child_id,))
+        child_row = cur.fetchone()
+        if child_row is None:
+            raise HTTPException(status_code=404, detail="child not found")
+        if payload.child_nickname.strip() != str(child_row["nickname"]):
+            raise HTTPException(status_code=400, detail="child nickname mismatch")
+
+        cur.execute(
+            """
+            SELECT id, child_id, status, backup_confirmed, requested_at, confirmed_at,
+                   scheduled_delete_at, cancelled_at, completed_at, deleted_counts_json
+            FROM delete_requests
+            WHERE child_id = %s AND status = 'confirmed'
+            ORDER BY requested_at DESC
+            LIMIT 1
+            """,
+            (payload.child_id,),
+        )
+        existing = cur.fetchone()
+        if existing:
+            return {"item": iso_row(existing), "status": "already_exists"}
+
+        item_id = str(uuid4())
+        request_json = {
+            "child_nickname": payload.child_nickname,
+            "confirmation_text": payload.confirmation_text,
+            "cooling_hours": DELETE_COOLING_HOURS,
+        }
+        cur.execute(
+            """
+            INSERT INTO delete_requests (
+                id, child_id, status, backup_confirmed, requested_at, confirmed_at,
+                scheduled_delete_at, request_json
+            ) VALUES (
+                %s, %s, 'confirmed', %s, UTC_TIMESTAMP(), UTC_TIMESTAMP(),
+                DATE_ADD(UTC_TIMESTAMP(), INTERVAL %s HOUR), CAST(%s AS JSON)
+            )
+            """,
+            (
+                item_id,
+                payload.child_id,
+                payload.backup_confirmed,
+                DELETE_COOLING_HOURS,
+                json.dumps(request_json, ensure_ascii=False),
+            ),
+        )
+        cur.execute(
+            """
+            SELECT id, child_id, status, backup_confirmed, requested_at, confirmed_at,
+                   scheduled_delete_at, cancelled_at, completed_at, deleted_counts_json
+            FROM delete_requests
+            WHERE id = %s
+            """,
+            (item_id,),
+        )
+        row = cur.fetchone()
+    return {"item": iso_row(row), "status": "created"}
+
+
+@app.post("/api/v1/delete-requests/{request_id}/cancel")
+def cancel_delete_request(request_id: str):
+    with db_cursor(commit=True) as cur:
+        ensure_delete_requests_table(cur)
+        cur.execute("SELECT id, status FROM delete_requests WHERE id = %s", (request_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="delete request not found")
+        if row["status"] == "completed":
+            raise HTTPException(status_code=409, detail="completed request cannot be cancelled")
+        cur.execute(
+            """
+            UPDATE delete_requests
+            SET status = 'cancelled', cancelled_at = UTC_TIMESTAMP()
+            WHERE id = %s AND status = 'confirmed'
+            """,
+            (request_id,),
+        )
+        cur.execute(
+            """
+            SELECT id, child_id, status, backup_confirmed, requested_at, confirmed_at,
+                   scheduled_delete_at, cancelled_at, completed_at, deleted_counts_json
+            FROM delete_requests
+            WHERE id = %s
+            """,
+            (request_id,),
+        )
+        updated = cur.fetchone()
+    return {"item": iso_row(updated), "status": "cancelled"}
+
+
+@app.post("/api/v1/delete-requests/{request_id}/execute")
+def execute_delete_request(request_id: str, payload: DeleteDataRequestExecute):
+    if payload.confirmation_text.strip() != DELETE_CONFIRMATION_TEXT:
+        raise HTTPException(status_code=400, detail="confirmation text mismatch")
+
+    refs: list[str] = []
+    counts: dict = {}
+    with db_cursor(commit=True) as cur:
+        ensure_delete_requests_table(cur)
+        cur.execute(
+            """
+            SELECT id, child_id, status, scheduled_delete_at
+            FROM delete_requests
+            WHERE id = %s
+            """,
+            (request_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="delete request not found")
+        if row["status"] != "confirmed":
+            raise HTTPException(status_code=409, detail="delete request is not executable")
+        if row["scheduled_delete_at"] and row["scheduled_delete_at"] > datetime.utcnow():
+            raise HTTPException(status_code=409, detail="cooling period is not over")
+
+        child_id = row["child_id"]
+        refs = collect_upload_refs_for_child(cur, child_id)
+        counts = delete_child_cloud_data(cur, child_id)
+        counts["upload_files_referenced"] = len(refs)
+        cur.execute(
+            """
+            UPDATE delete_requests
+            SET status = 'completed',
+                completed_at = UTC_TIMESTAMP(),
+                deleted_counts_json = CAST(%s AS JSON)
+            WHERE id = %s
+            """,
+            (json.dumps(counts, ensure_ascii=False), request_id),
+        )
+
+    try:
+        counts["upload_files_deleted"] = delete_upload_files(refs)
+    except Exception as exc:
+        counts["upload_file_delete_error"] = str(exc)
+    with db_cursor(commit=True) as cur:
+        ensure_delete_requests_table(cur)
+        cur.execute(
+            """
+            UPDATE delete_requests
+            SET deleted_counts_json = CAST(%s AS JSON)
+            WHERE id = %s
+            """,
+            (json.dumps(counts, ensure_ascii=False), request_id),
+        )
+        cur.execute(
+            """
+            SELECT id, child_id, status, backup_confirmed, requested_at, confirmed_at,
+                   scheduled_delete_at, cancelled_at, completed_at, deleted_counts_json
+            FROM delete_requests
+            WHERE id = %s
+            """,
+            (request_id,),
+        )
+        updated = cur.fetchone()
+    return {"item": iso_row(updated), "status": "completed"}
 
 
 @app.get("/api/v1/skin-logs")
@@ -362,10 +923,17 @@ def create_skin_log(payload: SkinLogRequest):
     with db_cursor(commit=True) as cur:
         cur.execute(
             """
-            INSERT INTO skin_logs (id, child_id, log_date, region, status, note, created_at)
-            VALUES (%s, %s, CURDATE(), %s, %s, %s, NOW())
+            INSERT INTO skin_logs (id, child_id, log_date, region, status, note, photos_json, created_at)
+            VALUES (%s, %s, CURDATE(), %s, %s, %s, CAST(%s AS JSON), NOW())
             """,
-            (item_id, payload.child_id, payload.region, payload.status, payload.note),
+            (
+                item_id,
+                payload.child_id,
+                payload.region,
+                payload.status,
+                payload.note,
+                json.dumps(payload.photos, ensure_ascii=False),
+            ),
         )
     return {"id": item_id, "status": "saved"}
 
@@ -416,6 +984,27 @@ def list_imaging(child_id: str = "demo-child"):
     return {"items": [iso_row(row) for row in rows]}
 
 
+@app.post("/api/v1/imaging")
+def create_imaging(payload: ImagingRequest):
+    item_id = str(uuid4())
+    with db_cursor(commit=True) as cur:
+        cur.execute(
+            """
+            INSERT INTO imaging_files (id, child_id, image_type, file_url, shot_date, note, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                item_id,
+                payload.child_id,
+                payload.image_type,
+                payload.file_url,
+                payload.shot_date,
+                payload.note,
+            ),
+        )
+    return {"id": item_id, "status": "saved"}
+
+
 @app.post("/api/v1/uploads")
 async def upload_file(file: UploadFile = File(...)):
     suffix = Path(file.filename or "upload.bin").suffix
@@ -427,6 +1016,16 @@ async def upload_file(file: UploadFile = File(...)):
         while chunk := await file.read(1024 * 1024):
             out.write(chunk)
     return {"id": file_id, "filename": file.filename, "size": destination.stat().st_size}
+
+
+@app.get("/api/v1/uploads/{file_id}")
+def get_upload(file_id: str):
+    if Path(file_id).name != file_id:
+        raise HTTPException(status_code=400, detail="invalid file id")
+    path = Path(settings.upload_dir) / file_id
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(path)
 
 
 @app.exception_handler(Exception)

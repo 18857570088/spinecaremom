@@ -9,6 +9,12 @@ CREATE TABLE IF NOT EXISTS children (
     prescribed_hours DECIMAL(4,1) NOT NULL DEFAULT 20.0,
     brace_type VARCHAR(32) NULL,
     first_visit_date DATE NULL,
+    guardian_phone VARCHAR(32) NULL,
+    verification_code VARCHAR(16) NULL,
+    login_method VARCHAR(32) NULL,
+    consent_accepted BOOLEAN NOT NULL DEFAULT TRUE,
+    source_json JSON NULL,
+    last_login_at DATETIME NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -107,13 +113,29 @@ CREATE TABLE IF NOT EXISTS ai_messages (
     INDEX idx_ai_child_created (child_id, created_at)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS delete_requests (
+    id VARCHAR(64) PRIMARY KEY,
+    child_id VARCHAR(64) NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
+    backup_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+    requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    confirmed_at DATETIME NULL,
+    scheduled_delete_at DATETIME NOT NULL,
+    cancelled_at DATETIME NULL,
+    completed_at DATETIME NULL,
+    deleted_counts_json JSON NULL,
+    request_json JSON NULL,
+    INDEX idx_delete_child_status (child_id, status),
+    INDEX idx_delete_child_requested (child_id, requested_at)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
 INSERT INTO children (
     id, nickname, gender, birth_date, cobb_initial, curve_type, risser,
     prescribed_hours, brace_type, first_visit_date
 ) VALUES (
     'demo-child', '朵朵', 'female', '2014-03-18', 25, 'thoracolumbar', '2',
     20.0, 'rigid', '2025-10-20'
-) ON DUPLICATE KEY UPDATE nickname = VALUES(nickname);
+) ON DUPLICATE KEY UPDATE nickname = VALUES(nickname), updated_at = CURRENT_TIMESTAMP;
 
 INSERT INTO alerts (id, child_id, type, level, title, summary, trigger_detail, status)
 VALUES
