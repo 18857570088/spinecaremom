@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import java.time.Duration
 import java.time.LocalDateTime
 import java.time.temporal.ChronoUnit
 import java.util.UUID
@@ -60,7 +61,10 @@ data class SpineBraceHistoryHeader(
     val deviceTimeText: String,
     val nextSaveSeconds: Int,
     val deviceTime: LocalDateTime?,
-)
+) {
+    val lastReadAtText: String get() = deviceTimeText
+    val lastReadAt: LocalDateTime? get() = deviceTime
+}
 
 data class SpineBraceWearPoint(
     val recordedAt: LocalDateTime,
@@ -74,6 +78,8 @@ data class SpineBraceHistorySnapshot(
     val wornBits: Int,
     val points: List<SpineBraceWearPoint>,
     val complete: Boolean,
+    val rawPacketsHex: List<String> = emptyList(),
+    val payloadSequences: List<Int> = emptyList(),
 ) {
     val summaryText: String =
         if (totalBits == 0) {
@@ -113,14 +119,19 @@ class SpineBraceBluetoothManager(
     private val incomingBuffer = ArrayDeque<Byte>()
     private val pendingNotificationDescriptors = ArrayDeque<BluetoothGattDescriptor>()
     private val historyPayloads = sortedMapOf<Int, ByteArray>()
+    private val historyRawPackets = sortedMapOf<Int, String>()
     private var historyHeader: SpineBraceHistoryHeader? = null
     private var gatt: BluetoothGatt? = null
     private var connectingDevice: SpineBraceDevice? = null
     private var connectedDevice: SpineBraceDevice? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var scanSession = 0
+    private var connectSession = 0
     private var scanning = false
     private var bleSetupInProgress = false
+    private var serviceDiscoveryRequested = false
+    private var connectTimeoutRunnable: Runnable? = null
+    private var setupTimeoutRunnable: Runnable? = null
 
     private val scanCallback =
         object : ScanCallback() {
@@ -154,12 +165,12 @@ class SpineBraceBluetoothManager(
         scanning = true
         val activeScanSession = ++scanSession
         scanner?.startScan(null, scanSettings, scanCallback)
-        notifyStatus("正在扫描 DR-Z-T0 脊柱侧弯设备...")
+        notifyStatus("正在扫描 WM-SP# 脊柱侧弯设备...")
         mainHandler.postDelayed(
             {
                 if (scanning && activeScanSession == scanSession) {
                     stopScan()
-                    notifyStatus("扫描完成，发现 ${devices.size} 个 DR-Z-T0 设备")
+                    notifyStatus("扫描完成，发现 ${devices.size} 个 WM-SP# 设备")
                 }
             },
             timeoutMs,
@@ -178,6 +189,11 @@ class SpineBraceBluetoothManager(
     @SuppressLint("MissingPermission")
     fun connect(device: SpineBraceDevice) {
         stopScan()
+        val activeDevice = connectingDevice ?: connectedDevice
+        if (gatt != null && activeDevice?.address.equals(device.address, ignoreCase = true)) {
+            notifyStatus("蓝牙设备 ${device.name} 正在连接或已连接，忽略重复连接请求")
+            return
+        }
         disconnectInternal(notify = false)
         val remoteDevice =
             try {
@@ -189,9 +205,16 @@ class SpineBraceBluetoothManager(
             notifyStatus("设备地址无效")
             return
         }
+        val activeConnectSession = ++connectSession
         connectingDevice = device
         notifyStatus("正在连接 ${device.name}...")
         gatt = remoteDevice.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        if (gatt == null) {
+            notifyStatus("蓝牙连接启动失败，请重新扫描后再连接")
+            connectingDevice = null
+            return
+        }
+        scheduleConnectTimeout(activeConnectSession)
     }
 
     @SuppressLint("MissingPermission")
@@ -205,10 +228,11 @@ class SpineBraceBluetoothManager(
         disconnectInternal(notify = false)
     }
 
-    fun requestHistory(reportStatus: Boolean = true) {
+    fun requestHistory(reportStatus: Boolean = true): Boolean {
         historyHeader = null
         historyPayloads.clear()
-        writeCommand(0x04, successText = "已发送读取一个月穿戴数据指令".takeIf { reportStatus })
+        historyRawPackets.clear()
+        return writeCommand(0x04, successText = "已发送读取一个月穿戴数据指令".takeIf { reportStatus })
     }
 
     fun zeroTemperature() {
@@ -219,7 +243,7 @@ class SpineBraceBluetoothManager(
         writeCommand(0x06, successText = "已发送获取版本号指令")
     }
 
-    fun clearMonthlyDataWithCurrentTime(reportStatus: Boolean = true) {
+    fun clearMonthlyDataWithCurrentTime(reportStatus: Boolean = true): Boolean {
         val now = LocalDateTime.now()
         val payload =
             byteArrayOf(
@@ -232,7 +256,8 @@ class SpineBraceBluetoothManager(
             )
         historyHeader = null
         historyPayloads.clear()
-        writeCommand(0x01, payload, successText = "已发送清空并重新开始保存指令".takeIf { reportStatus })
+        historyRawPackets.clear()
+        return writeCommand(0x01, payload, successText = "已发送清空并重新开始保存指令".takeIf { reportStatus })
     }
 
     fun writeUniqueCodeLastSix(code: Int) {
@@ -250,6 +275,10 @@ class SpineBraceBluetoothManager(
     @SuppressLint("MissingPermission")
     private fun disconnectInternal(notify: Boolean) {
         val hadConnection = connectedDevice != null || connectingDevice != null || gatt != null
+        val caller = Throwable().stackTrace.drop(1).firstOrNull()
+        Log.i(TAG, "disconnectInternal notify=$notify hadConnection=$hadConnection caller=${caller?.methodName}")
+        cancelConnectTimeout()
+        cancelSetupTimeout()
         writeCharacteristic = null
         pendingNotificationDescriptors.clear()
         bleSetupInProgress = false
@@ -270,12 +299,12 @@ class SpineBraceBluetoothManager(
     }
 
     @SuppressLint("MissingPermission")
-    private fun writeCommand(command: Int, payload: ByteArray = byteArrayOf(), successText: String?) {
+    private fun writeCommand(command: Int, payload: ByteArray = byteArrayOf(), successText: String?): Boolean {
         val targetGatt = gatt
         val targetCharacteristic = writeCharacteristic
         if (targetGatt == null || targetCharacteristic == null) {
             notifyStatus("请先连接蓝牙设备")
-            return
+            return false
         }
         val packet = buildCommandPacket(command, payload)
         val ok =
@@ -292,6 +321,7 @@ class SpineBraceBluetoothManager(
         } else if (successText != null) {
             notifyStatus("蓝牙写入失败，请保持设备连接后重试")
         }
+        return ok
     }
 
     private val gattCallback =
@@ -308,15 +338,17 @@ class SpineBraceBluetoothManager(
                             handleDisconnected(gatt, status)
                             return
                         }
+                        cancelConnectTimeout()
+                        serviceDiscoveryRequested = false
                         runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) }
+                        val mtuRequested = runCatching { gatt.requestMtu(REQUESTED_MTU) }.getOrDefault(false)
                         notifyStatus("已连接，正在发现服务...")
+                        scheduleSetupTimeout(gatt)
                         mainHandler.postDelayed(
                             {
-                                if (this@SpineBraceBluetoothManager.gatt === gatt) {
-                                    gatt.discoverServices()
-                                }
+                                startServiceDiscovery(gatt)
                             },
-                            BLE_SERVICE_DISCOVERY_DELAY_MS,
+                            if (mtuRequested) BLE_MTU_DISCOVERY_FALLBACK_DELAY_MS else BLE_SERVICE_DISCOVERY_FAST_FALLBACK_DELAY_MS,
                         )
                     }
 
@@ -329,6 +361,7 @@ class SpineBraceBluetoothManager(
                 if (this@SpineBraceBluetoothManager.gatt !== gatt) {
                     return
                 }
+                Log.i(TAG, "onServicesDiscovered status=$status")
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     notifyStatus("服务发现失败：$status")
                     disconnectInternal(notify = true)
@@ -372,6 +405,11 @@ class SpineBraceBluetoothManager(
                 if (writeCharacteristic == null) {
                     notifyStatus("未找到可写入的蓝牙通道")
                 }
+                if (writeCharacteristic == null || notifyCount == 0) {
+                    notifyStatus("蓝牙通道初始化失败，请重新连接设备")
+                    disconnectInternal(notify = true)
+                    return
+                }
                 if (item != null) {
                     connectedDevice = item
                     connectingDevice = null
@@ -400,6 +438,14 @@ class SpineBraceBluetoothManager(
                 handleIncomingBytes(value)
             }
 
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                if (this@SpineBraceBluetoothManager.gatt !== gatt) {
+                    return
+                }
+                Log.i(TAG, "mtu changed mtu=$mtu status=$status")
+                startServiceDiscovery(gatt)
+            }
+
             override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
                 if (this@SpineBraceBluetoothManager.gatt !== gatt) {
                     return
@@ -423,8 +469,60 @@ class SpineBraceBluetoothManager(
         writeCharacteristic = null
         pendingNotificationDescriptors.clear()
         bleSetupInProgress = false
+        serviceDiscoveryRequested = false
+        cancelConnectTimeout()
+        cancelSetupTimeout()
         notifyStatus("BLE连接断开 status=$status")
         notifyDisconnected()
+    }
+
+    private fun scheduleConnectTimeout(activeConnectSession: Int) {
+        cancelConnectTimeout()
+        val timeoutRunnable =
+            Runnable {
+                if (connectSession == activeConnectSession && connectedDevice == null && connectingDevice != null) {
+                    notifyStatus("蓝牙连接超时，请保持设备靠近后重新连接")
+                    disconnectInternal(notify = true)
+                }
+            }
+        connectTimeoutRunnable = timeoutRunnable
+        mainHandler.postDelayed(timeoutRunnable, BLE_CONNECT_TIMEOUT_MS)
+    }
+
+    private fun cancelConnectTimeout() {
+        connectTimeoutRunnable?.let(mainHandler::removeCallbacks)
+        connectTimeoutRunnable = null
+    }
+
+    private fun scheduleSetupTimeout(gatt: BluetoothGatt) {
+        cancelSetupTimeout()
+        val timeoutRunnable =
+            Runnable {
+                if (this.gatt === gatt && connectedDevice == null) {
+                    notifyStatus("蓝牙服务初始化超时，请重新连接设备")
+                    disconnectInternal(notify = true)
+                }
+            }
+        setupTimeoutRunnable = timeoutRunnable
+        mainHandler.postDelayed(timeoutRunnable, BLE_SETUP_TIMEOUT_MS)
+    }
+
+    private fun cancelSetupTimeout() {
+        setupTimeoutRunnable?.let(mainHandler::removeCallbacks)
+        setupTimeoutRunnable = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startServiceDiscovery(gatt: BluetoothGatt) {
+        if (this.gatt !== gatt || serviceDiscoveryRequested) {
+            return
+        }
+        serviceDiscoveryRequested = true
+        Log.i(TAG, "startServiceDiscovery")
+        if (!gatt.discoverServices()) {
+            notifyStatus("蓝牙服务发现启动失败，请重新连接设备")
+            disconnectInternal(notify = true)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -449,6 +547,7 @@ class SpineBraceBluetoothManager(
         val descriptor = pendingNotificationDescriptors.removeFirstOrNull()
         if (descriptor == null) {
             bleSetupInProgress = false
+            cancelSetupTimeout()
             connectedDevice?.let(::notifyConnected)
             notifyStatus("蓝牙已就绪")
             return
@@ -562,13 +661,48 @@ class SpineBraceBluetoothManager(
         if (data.isEmpty()) {
             return
         }
-        val sequence = data[0].toInt() and 0xFF
-        if (sequence == 0) {
+        val isHeader = historyHeader == null && looksLikeHistoryHeader(data)
+        if (isHeader) {
+            historyRawPackets[0] = packet.toHexString()
             historyHeader = parseHistoryHeader(data)
         } else {
-            historyPayloads[sequence] = data.copyOfRange(1, data.size)
+            val sequence = data[0].toInt() and 0xFF
+            val header = historyHeader
+            if (header?.count == 0) {
+                Log.i(TAG, "ignore empty history payload sequence=$sequence because header count=0")
+            } else {
+                historyRawPackets[sequence] = packet.toHexString()
+                historyPayloads[sequence] = data.copyOfRange(1, data.size)
+            }
         }
         notifyHistory(historySnapshot())
+    }
+
+    private fun looksLikeHistoryHeader(data: ByteArray): Boolean {
+        if (data.size < 13) {
+            return false
+        }
+        val head = readUInt16BigEndian(data, 0)
+        val count = readUInt16BigEndian(data, 2)
+        val year = data.u8(5)
+        val month = data.u8(6)
+        val day = data.u8(7)
+        val hour = data.u8(8)
+        val minute = data.u8(9)
+        val second = data.u8(10)
+        val timeBytes = listOf(year, month, day, hour, minute, second)
+        val timeMissing = timeBytes.all { it == 0xFF }
+        val timeValid =
+            year in 0..99 &&
+                month in 1..12 &&
+                day in 1..31 &&
+                hour in 0..23 &&
+                minute in 0..59 &&
+                second in 0..59
+        return head in 0..MAX_HISTORY_BITS &&
+            count in 0..MAX_HISTORY_BITS &&
+            (timeMissing || timeValid) &&
+            parseNextSaveSeconds(data) in 0..600
     }
 
     private fun parseHistoryHeader(data: ByteArray): SpineBraceHistoryHeader {
@@ -597,37 +731,47 @@ class SpineBraceBluetoothManager(
             } else {
                 "--"
             }
-        val nextSeconds = if (data.size >= 13) readUInt16LittleEndian(data, 11) else 0
+        val nextSeconds = parseNextSaveSeconds(data)
         return SpineBraceHistoryHeader(head = head, count = count, deviceTimeText = timeText, nextSaveSeconds = nextSeconds, deviceTime = deviceTime)
+    }
+
+    private fun parseNextSaveSeconds(data: ByteArray): Int {
+        val nextByte = if (data.size >= 12) data.u8(11) else 0
+        val nextWord = if (data.size >= 13) readUInt16LittleEndian(data, 11) else nextByte
+        return when {
+            nextWord in 0..600 -> nextWord
+            nextByte in 0..600 -> nextByte
+            else -> 0
+        }
     }
 
     private fun historySnapshot(): SpineBraceHistorySnapshot {
         val bits =
             historyPayloads.values.flatMap { payload ->
                 payload.flatMap { byte ->
-                    (0..7).map { bit -> ((byte.toInt() and 0xFF) shr bit) and 1 == 1 }
+                    (0..7).map { bit ->
+                        val bitSet = ((byte.toInt() and 0xFF) shr bit) and 1 == 1
+                        decodeHistoryWornBit(bitSet)
+                    }
                 }
             }
         val expectedCount = historyHeader?.count?.takeIf { it > 0 }
-        val visibleBits = if (expectedCount != null && expectedCount <= bits.size) bits.takeLast(expectedCount) else bits
         val header = historyHeader
-        val nextSeconds = header?.nextSaveSeconds?.coerceIn(0, 600) ?: 0
-        val latestPointTime =
-            (header?.deviceTime ?: LocalDateTime.now())
-                .minusSeconds((600 - nextSeconds).toLong())
-                .truncatedTo(ChronoUnit.MINUTES)
-        val points =
-            visibleBits.mapIndexed { index, worn ->
-                val minutesAgo = (visibleBits.size - 1 - index) * 10L
-                SpineBraceWearPoint(recordedAt = latestPointTime.minusMinutes(minutesAgo), worn = worn)
-            }
+        val visibleBits = orderedHistoryBits(bits, header, expectedCount)
+        val points = buildHistoryPoints(visibleBits, header)
         val complete =
             header != null &&
                 when {
-                    expectedCount != null -> bits.size >= expectedCount
-                    header.count == 0 && historyPayloads.isEmpty() -> true
-                    else -> historyPayloads.size >= EXPECTED_HISTORY_DATA_PACKETS
+                    header.count == 0 -> true
+                    expectedCount != null -> hasCompleteHistoryPayloadSet()
+                    else -> hasCompleteHistoryPayloadSet()
                 }
+        if (header != null) {
+            Log.i(
+                TAG,
+                "history snapshot head=${header.head} count=${header.count} payloadBits=${bits.size} visibleBits=${visibleBits.size} packets=${historyPayloads.size} complete=$complete worn=${visibleBits.count { it }}",
+            )
+        }
         return SpineBraceHistorySnapshot(
             header = header,
             packetCount = historyPayloads.size + if (historyHeader != null) 1 else 0,
@@ -635,8 +779,94 @@ class SpineBraceBluetoothManager(
             wornBits = visibleBits.count { it },
             points = points,
             complete = complete,
+            rawPacketsHex = historyRawPackets.values.toList(),
+            payloadSequences = historyRawPackets.keys.toList(),
         )
     }
+
+    private fun buildHistoryPoints(
+        visibleBits: List<Boolean>,
+        header: SpineBraceHistoryHeader?,
+    ): List<SpineBraceWearPoint> {
+        if (visibleBits.isEmpty()) {
+            return emptyList()
+        }
+        val now = LocalDateTime.now()
+        val deviceTime = header?.deviceTime
+        val nextSeconds = header?.nextSaveSeconds?.coerceIn(0, 600) ?: 0
+        val latestFromEndAnchor =
+            (deviceTime ?: now)
+                .minusSeconds((600 - nextSeconds).toLong())
+                .truncatedTo(ChronoUnit.MINUTES)
+        val latestFromStartAnchor =
+            deviceTime?.plusMinutes(visibleBits.size * 10L)?.truncatedTo(ChronoUnit.MINUTES)
+        val endAnchorDrift = absMinutesBetween(latestFromEndAnchor, now)
+        val startAnchorDrift = latestFromStartAnchor?.let { absMinutesBetween(it, now) } ?: Long.MAX_VALUE
+        val useStartAnchor =
+            deviceTime != null &&
+                latestFromStartAnchor != null &&
+                startAnchorDrift <= START_ANCHOR_MAX_DRIFT_MINUTES &&
+                startAnchorDrift + ANCHOR_SWITCH_MARGIN_MINUTES < endAnchorDrift
+        if (deviceTime != null) {
+            Log.i(
+                TAG,
+                "history time anchor mode=${if (useStartAnchor) "start" else "end"} deviceTime=$deviceTime latestFromStart=$latestFromStartAnchor latestFromEnd=$latestFromEndAnchor startDrift=$startAnchorDrift endDrift=$endAnchorDrift now=$now",
+            )
+        }
+        return visibleBits.mapIndexed { index, worn ->
+            val recordedAt =
+                if (useStartAnchor && deviceTime != null) {
+                    deviceTime.plusMinutes((index + 1) * 10L).truncatedTo(ChronoUnit.MINUTES)
+                } else {
+                    val minutesAgo = (visibleBits.size - 1 - index) * 10L
+                    latestFromEndAnchor.minusMinutes(minutesAgo)
+                }
+            SpineBraceWearPoint(recordedAt = recordedAt, worn = worn)
+        }
+    }
+
+    private fun absMinutesBetween(a: LocalDateTime, b: LocalDateTime): Long =
+        kotlin.math.abs(Duration.between(a, b).toMinutes())
+
+    private fun orderedHistoryBits(
+        bits: List<Boolean>,
+        header: SpineBraceHistoryHeader?,
+        expectedCount: Int?,
+    ): List<Boolean> {
+        if (bits.isEmpty()) {
+            return emptyList()
+        }
+        val count = (expectedCount ?: bits.size).coerceIn(0, bits.size)
+        if (count == 0) {
+            return emptyList()
+        }
+        if (header == null) {
+            return bits.take(count)
+        }
+        val capacity = bits.size
+        val head = positiveMod(header.head, capacity)
+        return if (count < capacity) {
+            val endExclusive =
+                when {
+                    header.head in count..capacity -> header.head
+                    header.head == 0 && count == capacity -> capacity
+                    else -> count
+                }
+            val start = (endExclusive - count).coerceAtLeast(0)
+            bits.subList(start, start + count)
+        } else {
+            List(count) { offset -> bits[(head + offset) % capacity] }
+        }
+    }
+
+    private fun positiveMod(value: Int, modulus: Int): Int =
+        ((value % modulus) + modulus) % modulus
+
+    private fun hasCompleteHistoryPayloadSet(): Boolean =
+        (1..EXPECTED_HISTORY_DATA_PACKETS).all { sequence -> historyPayloads.containsKey(sequence) }
+
+    private fun decodeHistoryWornBit(bitSet: Boolean): Boolean =
+        if (HISTORY_ZERO_BIT_MEANS_WORN) !bitSet else bitSet
 
     private fun buildCommandPacket(command: Int, payload: ByteArray = byteArrayOf()): ByteArray {
         val body = ByteArray(3 + payload.size)
@@ -680,6 +910,7 @@ class SpineBraceBluetoothManager(
     }
 
     private fun notifyStatus(message: String) {
+        Log.i(TAG, message)
         mainHandler.post { callback.onStatus(message) }
     }
 
@@ -765,19 +996,29 @@ class SpineBraceBluetoothManager(
     private fun ByteArray.toHexString(): String =
         joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
 
-    private companion object {
+    companion object {
         const val TAG = "SpineBraceBT"
-        const val DEVICE_PREFIX = "DR-Z-T0"
+        const val DEVICE_PREFIX = "WM-SP#"
         const val SCAN_TIMEOUT_MS = 10_000L
-        const val BLE_SERVICE_DISCOVERY_DELAY_MS = 350L
+        const val BLE_CONNECT_TIMEOUT_MS = 10_000L
+        const val BLE_SETUP_TIMEOUT_MS = 30_000L
+        const val BLE_MTU_DISCOVERY_FALLBACK_DELAY_MS = 6_000L
+        const val BLE_SERVICE_DISCOVERY_FAST_FALLBACK_DELAY_MS = 600L
+        const val REQUESTED_MTU = 247
         const val MIN_PACKET_SIZE = 5
         const val MAX_BUFFER_SIZE = 512
         const val TELEMETRY_PACKET_SIZE = 15
         const val HISTORY_PACKET_SIZE = 18
         const val HISTORY_ALT_PACKET_SIZE = 20
-        const val EXPECTED_HISTORY_DATA_PACKETS = 36
+        const val EXPECTED_HISTORY_DATA_PACKETS = 45
+        const val HISTORY_PAYLOAD_BYTES = 12
+        const val MAX_HISTORY_BITS = EXPECTED_HISTORY_DATA_PACKETS * HISTORY_PAYLOAD_BYTES * 8
+        const val START_ANCHOR_MAX_DRIFT_MINUTES = 180L
+        const val ANCHOR_SWITCH_MARGIN_MINUTES = 5L
+        // Protocol command 04 follows the same wear-bit semantics as command 03: 1 = worn, 0 = not worn.
+        const val HISTORY_ZERO_BIT_MEANS_WORN = false
         const val VERSION_PACKET_SIZE = 7
-        val DEVICE_NAME_REGEX = Regex("DR-Z-T0[A-Za-z0-9_-]*", RegexOption.IGNORE_CASE)
+        val DEVICE_NAME_REGEX = Regex("WM-SP#[A-Za-z0-9_-]*", RegexOption.IGNORE_CASE)
         val CLIENT_CONFIG_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 }

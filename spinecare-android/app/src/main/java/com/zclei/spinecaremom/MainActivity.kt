@@ -17,7 +17,10 @@ import android.os.Handler
 import android.os.Looper
 import android.text.Editable
 import android.text.InputType
+import android.text.SpannableString
+import android.text.Spanned
 import android.text.TextWatcher
+import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -46,10 +49,12 @@ import com.zclei.spinecaremom.bluetooth.SpineBraceDevice
 import com.zclei.spinecaremom.bluetooth.SpineBraceHistorySnapshot
 import com.zclei.spinecaremom.bluetooth.SpineBraceTelemetry
 import com.zclei.spinecaremom.bluetooth.SpineBraceVersion
+import com.zclei.spinecaremom.bluetooth.SpineBraceWearPoint
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.Period
@@ -134,6 +139,17 @@ class MainActivity : AppCompatActivity() {
         val createdAt: String,
     )
 
+    private data class AlertItem(
+        val id: String,
+        val type: String,
+        val level: String,
+        val title: String,
+        val summary: String,
+        val triggerDetail: String,
+        val status: String,
+        val createdAt: String,
+    )
+
     private data class WearSummary(
         val avgHours: Double,
         val prescribedHours: Double,
@@ -145,6 +161,9 @@ class MainActivity : AppCompatActivity() {
     private data class WearRecord(
         val date: LocalDate,
         val wornHours: Double,
+        val lastReadAt: LocalDateTime? = null,
+        val historyHead: Int? = null,
+        val historyCount: Int? = null,
         val hourlyRows: List<BluetoothValidationHour> = emptyList(),
     )
 
@@ -172,18 +191,47 @@ class MainActivity : AppCompatActivity() {
         val note: String,
     )
 
+    private data class BluetoothValidationSample(
+        val recordedAt: LocalDateTime,
+        val worn: Boolean,
+    )
+
     private data class BluetoothValidationHour(
         val hourStart: LocalDateTime,
         val wornHours: Double,
+        val sampleCount: Int = 6,
+        val wornCount: Int = (wornHours * 6).roundToInt(),
+        val samples: List<BluetoothValidationSample> = emptyList(),
     )
 
     private data class DeviceWearUploadPackage(
+        val childId: String,
         val payload: JSONObject,
         val hourlyRows: List<BluetoothValidationHour>,
+        val expectedWearPoints: List<SpineBraceWearPoint>,
         val fetchedAt: LocalDateTime,
+        val lastReadAt: LocalDateTime?,
+        val historyHead: Int?,
+        val historyCount: Int?,
         val dailyCount: Int,
         val totalWornHours: Double,
         val deviceName: String?,
+    )
+
+    private data class DeviceWearCloudVerification(
+        val verified: Boolean,
+        val expectedCount: Int,
+        val matchedCount: Int,
+        val missingCount: Int,
+        val mismatchedCount: Int,
+    )
+
+    private data class DeviceWearLocalVerification(
+        val verified: Boolean,
+        val expectedCount: Int,
+        val matchedCount: Int,
+        val missingCount: Int,
+        val mismatchedCount: Int,
     )
 
     private sealed class ChatMessage {
@@ -215,7 +263,9 @@ class MainActivity : AppCompatActivity() {
     private var logsTab = 0
     private var helpSection = HelpSection.Home
     private var helpFaqExpandedIndex: Int? = null
-    private var consentChecked = true
+    private var consentChecked = false
+    private var agreementReadConfirmed = false
+    private var loginAgreementExpanded = false
     private var remindersOn = true
     private var skinReminderOn = true
     private var selectedLanguageIndex = 0
@@ -240,6 +290,13 @@ class MainActivity : AppCompatActivity() {
     private var reportArchiveStatusMessage: String? = null
     private var archivedReports: List<ArchivedReport> = emptyList()
     private var selectedArchivedReportId: String? = null
+    private var alertsLoading = false
+    private var alertsLoadedChildId: String? = null
+    private var alertsLastRequestChildId: String? = null
+    private var alertsStatusMessage: String? = null
+    private var alertItems: List<AlertItem> = emptyList()
+    private val handlingAlertIds = mutableSetOf<String>()
+    private var alertsBackTarget = MainTab.Home
     private var dataExportInProgress = false
     private var dataExportStatusMessage: String? = null
     private var pendingDataExportJson: String? = null
@@ -288,7 +345,7 @@ class MainActivity : AppCompatActivity() {
     private val bluetoothDevices = mutableListOf<SpineBraceDevice>()
     private var selectedBluetoothDevice: SpineBraceDevice? = null
     private var connectedBluetoothDevice: SpineBraceDevice? = null
-    private var bluetoothStatusMessage = "未连接设备，请扫描 DR-Z-T0 脊柱侧弯设备。"
+    private var bluetoothStatusMessage = "未连接设备，请扫描 WM-SP# 脊柱侧弯设备。"
     private var bluetoothHomeWarningMessage: String? = null
     private var autoConnectTargetDevice: SpineBraceDevice? = null
     private var autoConnectInProgress = false
@@ -301,6 +358,9 @@ class MainActivity : AppCompatActivity() {
     private var latestHistoryReceivedAt: LocalDateTime? = null
     private var latestUploadValidationRows: List<BluetoothValidationHour> = emptyList()
     private var latestUploadFetchedAt: LocalDateTime? = null
+    private var latestUploadLastReadAt: LocalDateTime? = null
+    private var latestUploadHistoryHead: Int? = null
+    private var latestUploadHistoryCount: Int? = null
     private var latestUploadCompletedAt: LocalDateTime? = null
     private var latestUploadDailyCount = 0
     private var latestUploadTotalWornHours = 0.0
@@ -309,9 +369,13 @@ class MainActivity : AppCompatActivity() {
     private var pendingBluetoothAction: (() -> Unit)? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var pendingHistoryUploadRunnable: Runnable? = null
+    private var historyReadTimeoutRunnable: Runnable? = null
     private var deviceSyncInProgress = false
     private var deviceSyncUploading = false
     private var deviceSyncCompleted = false
+    private var deviceHistoryReadRetries = 0
+    private var deviceSyncReconnectRetries = 0
+    private var resumingDeviceSyncAfterDisconnect = false
     private val deviceReadingMessage = "正在读取设备数据 ，请稍候"
     private val deviceReadCompleteMessage = "数据读取完成"
     private val prefs by lazy { getSharedPreferences(PREFS_NAME, MODE_PRIVATE) }
@@ -368,6 +432,8 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 override fun onConnected(device: SpineBraceDevice) {
+                    val resumingSync = resumingDeviceSyncAfterDisconnect
+                    resumingDeviceSyncAfterDisconnect = false
                     connectedBluetoothDevice = device
                     selectedBluetoothDevice = device
                     saveLastBluetoothDevice(device)
@@ -378,31 +444,53 @@ class MainActivity : AppCompatActivity() {
                     if (bluetoothHomeWarningMessage == AUTO_CONNECT_NOT_FOUND_MESSAGE) {
                         setHomeBluetoothWarning(null)
                     }
+                    val phase = prefs.getString(KEY_DEVICE_SYNC_PHASE, null)
+                    if (deviceSyncUploading &&
+                        pendingDeviceWearFile().exists() &&
+                        phase in setOf(DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, DEVICE_SYNC_PHASE_CLOUD_UPLOADING)
+                    ) {
+                        bluetoothStatusMessage = "正在从手机本地上传云端，完成后再读取设备新数据"
+                        refreshBluetoothUi()
+                        return
+                    }
                     latestBraceTelemetry = null
                     latestHistorySnapshot = null
                     latestHistoryReceivedAt = null
                     latestUploadValidationRows = emptyList()
                     latestUploadFetchedAt = null
+                    latestUploadLastReadAt = null
+                    latestUploadHistoryHead = null
+                    latestUploadHistoryCount = null
                     latestUploadCompletedAt = null
                     latestUploadDailyCount = 0
                     latestUploadTotalWornHours = 0.0
                     latestUploadDeviceName = device.name
                     latestUploadStatus = "正在读取设备数据，准备上传云端"
-                    startAutoDeviceDataSync()
+                    startAutoDeviceDataSync(resetRetryCounters = !resumingSync)
                     refreshBluetoothUi()
                 }
 
                 override fun onDisconnected() {
+                    if (handleDeviceSyncDisconnected()) {
+                        return
+                    }
+                    val phase = prefs.getString(KEY_DEVICE_SYNC_PHASE, null)
+                    val preserveLocalCloudUpload =
+                        pendingDeviceWearFile().exists() &&
+                            phase in setOf(DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, DEVICE_SYNC_PHASE_CLOUD_UPLOADING)
                     connectedBluetoothDevice = null
                     latestBraceTelemetry = null
                     pendingHistoryUploadRunnable?.let(mainHandler::removeCallbacks)
                     pendingHistoryUploadRunnable = null
+                    cancelHistoryReadTimeout()
                     cancelAutoConnectTimeout()
                     autoConnectInProgress = false
                     autoConnectTargetDevice = null
-                    deviceSyncInProgress = false
-                    deviceSyncUploading = false
-                    deviceSyncCompleted = false
+                    if (!preserveLocalCloudUpload) {
+                        deviceSyncInProgress = false
+                        deviceSyncUploading = false
+                        deviceSyncCompleted = false
+                    }
                     cancelBluetoothAutoDisconnect()
                     if (bluetoothHomeWarningMessage == LOW_BATTERY_WARNING_MESSAGE) {
                         setHomeBluetoothWarning(null)
@@ -414,15 +502,21 @@ class MainActivity : AppCompatActivity() {
                         } else {
                             "蓝牙已断开"
                         }
-                    bluetoothStatusMessage = disconnectedStatusMessage
+                    bluetoothStatusMessage =
+                        if (preserveLocalCloudUpload) {
+                            "蓝牙已断开，正在继续从手机本地上传云端"
+                        } else {
+                            disconnectedStatusMessage
+                        }
                     refreshBluetoothUi()
                 }
 
                 override fun onTelemetry(telemetry: SpineBraceTelemetry) {
-                    if (latestBraceTelemetry != null) {
+                    val hadTelemetry = latestBraceTelemetry != null
+                    latestBraceTelemetry = telemetry
+                    if (hadTelemetry) {
                         return
                     }
-                    latestBraceTelemetry = telemetry
                     updateBatteryHomeWarning(telemetry)
                     if (deviceSyncInProgress && !deviceSyncCompleted) {
                         bluetoothStatusMessage = deviceReadingMessage
@@ -448,8 +542,13 @@ class MainActivity : AppCompatActivity() {
                     latestHistorySnapshot = snapshot
                     latestHistoryReceivedAt = LocalDateTime.now()
                     if (deviceSyncInProgress && !deviceSyncCompleted) {
+                        saveDeviceHistorySessionTemp(snapshot)
                         bluetoothStatusMessage = deviceReadingMessage
-                        scheduleDeviceHistoryUpload(snapshot)
+                        if (snapshot.complete) {
+                            scheduleDeviceHistoryUpload(snapshot)
+                        } else {
+                            scheduleHistoryReadTimeout()
+                        }
                     } else if (deviceSyncCompleted) {
                         bluetoothStatusMessage = deviceReadCompleteMessage
                     } else {
@@ -562,14 +661,28 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         selectedLanguageIndex = loadSelectedLanguageIndex()
         loadProfileFromLocal()
+        recoverPendingDeviceSyncState()
         configureWindow(window)
         render()
-        mainHandler.post { autoConnectLastBluetoothDevice() }
+        mainHandler.post {
+            if (!resumePendingLocalWearUploadIfNeeded()) {
+                autoConnectLastBluetoothDevice()
+            }
+        }
     }
 
     override fun onDestroy() {
+        if ((deviceSyncInProgress || deviceSyncUploading) && !deviceSyncCompleted) {
+            val phase = prefs.getString(KEY_DEVICE_SYNC_PHASE, null)
+            if (pendingDeviceWearFile().exists() && phase in setOf(DEVICE_SYNC_PHASE_CLEARING, DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, DEVICE_SYNC_PHASE_CLOUD_UPLOADING)) {
+                markDeviceSyncPhase(DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, "APP 已退出，手机本地数据已保留；下次打开后将继续上传云端。")
+            } else {
+                markDeviceSyncInterrupted("APP 已退出，本次数据获取未安全完成；设备历史数据不会被清理，下次连接后将重新读取。")
+            }
+        }
         pendingHistoryUploadRunnable?.let(mainHandler::removeCallbacks)
         pendingHistoryUploadRunnable = null
+        cancelHistoryReadTimeout()
         cancelAutoConnectTimeout()
         cancelBluetoothAutoDisconnect()
         spineBraceBluetooth.close()
@@ -629,10 +742,10 @@ class MainActivity : AppCompatActivity() {
                             )
                             addSpace(12)
                             addView(primaryButton("登录 / 注册") {
-                                if (consentChecked) {
-                                    loginMethod = "sms"
-                                    continueAfterLogin()
-                                }
+                                loginMethod = "sms"
+                                continueAfterLogin()
+                            }.apply {
+                                styleLoginSubmitState(this)
                             }, matchLp())
                             addSpace(8)
                             addView(label("— 或 —", 13f, P.muted, Typeface.NORMAL, Gravity.CENTER))
@@ -640,16 +753,31 @@ class MainActivity : AppCompatActivity() {
                             addView(secondaryButton("微信一键登录") {
                                 loginMethod = "wechat"
                                 continueAfterLogin()
+                            }.apply {
+                                styleSecondarySubmitState(this)
                             }, matchLp())
                             addSpace(10)
+                            addView(loginAgreementPanel())
+                            addSpace(8)
                             addView(
                                 CheckBox(this@MainActivity).apply {
-                                    text = uiText("我已阅读并同意《隐私政策》《监护人授权告知》")
-                                    setTextColor(P.secondary)
+                                    text = uiText("我已阅读并同意《用户协议》《隐私政策》")
+                                    setTextColor(if (agreementReadConfirmed) P.secondary else P.muted)
                                     textSize = 13f
                                     isChecked = consentChecked
                                     buttonTintList = android.content.res.ColorStateList.valueOf(P.primary)
-                                    setOnCheckedChangeListener { _, checked -> consentChecked = checked }
+                                    setOnCheckedChangeListener { button, checked ->
+                                        if (checked && !agreementReadConfirmed) {
+                                            consentChecked = false
+                                            loginAgreementExpanded = true
+                                            button.isChecked = false
+                                            Toast.makeText(this@MainActivity, uiText("请先阅读用户协议，阅读完毕后再勾选同意。"), Toast.LENGTH_SHORT).show()
+                                            render()
+                                        } else {
+                                            consentChecked = checked
+                                            saveLoginConsentState()
+                                        }
+                                    }
                                 },
                             )
                         },
@@ -661,9 +789,104 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun loginAgreementPanel(): View =
+        vertical {
+            background = rounded(P.surfaceAlt, dp(8), P.softLine)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            addView(
+                horizontal {
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(label("用户协议与隐私政策", 15f, P.text, Typeface.BOLD), weightLp(1f))
+                    addView(
+                        chip(
+                            if (agreementReadConfirmed) "已阅读" else "待阅读",
+                            if (agreementReadConfirmed) P.success else P.warning,
+                        ),
+                    )
+                },
+            )
+            addSpace(6)
+            addView(label("登录前请先阅读用户协议和隐私政策。阅读完毕后勾选同意，才可以登录。", 13f, P.secondary))
+            addSpace(8)
+            addView(
+                horizontal {
+                    addView(secondaryButton(if (loginAgreementExpanded) "收起用户协议" else "查看用户协议") {
+                        loginAgreementExpanded = !loginAgreementExpanded
+                        render()
+                    }, weightLp(1f))
+                    if (loginAgreementExpanded) {
+                        addSpace(8, horizontal = true)
+                        addView(primaryButton("我已阅读完毕") {
+                            markLoginAgreementRead()
+                        }, weightLp(1f))
+                    }
+                },
+            )
+            if (loginAgreementExpanded) {
+                addSpace(10)
+                addView(label("用户协议", 15f, P.text, Typeface.BOLD))
+                userAgreementSections().forEach { (heading, body) ->
+                    addDocumentSection(heading, body)
+                }
+                addSpace(6)
+                addView(label("隐私政策", 15f, P.text, Typeface.BOLD))
+                privacyPolicySections().forEach { (heading, body) ->
+                    addDocumentSection(heading, body)
+                }
+                addSpace(8)
+                addView(primaryButton("我已阅读完毕") {
+                    markLoginAgreementRead()
+                }, matchLp())
+            }
+        }
+
+    private fun markLoginAgreementRead() {
+        agreementReadConfirmed = true
+        consentChecked = false
+        saveLoginConsentState()
+        Toast.makeText(this, uiText("已阅读，请勾选同意后登录"), Toast.LENGTH_SHORT).show()
+        render()
+    }
+
+    private fun saveLoginConsentState() {
+        prefs.edit()
+            .putBoolean(KEY_CONSENT_CHECKED, consentChecked)
+            .putBoolean(KEY_LOGIN_AGREEMENT_READ, agreementReadConfirmed)
+            .apply()
+    }
+
+    private fun canSubmitLogin(): Boolean = agreementReadConfirmed && consentChecked
+
+    private fun ensureLoginConsentReady(): Boolean {
+        if (!agreementReadConfirmed) {
+            loginAgreementExpanded = true
+            Toast.makeText(this, uiText("请先阅读用户协议，阅读完毕后再勾选同意。"), Toast.LENGTH_SHORT).show()
+            render()
+            return false
+        }
+        if (!consentChecked) {
+            Toast.makeText(this, uiText("请勾选已阅读并同意后再登录。"), Toast.LENGTH_SHORT).show()
+            return false
+        }
+        return true
+    }
+
+    private fun styleLoginSubmitState(button: Button) {
+        val enabled = canSubmitLogin()
+        button.alpha = if (enabled) 1f else 0.62f
+        button.background = rounded(if (enabled) P.primary else P.muted, dp(8), null)
+    }
+
+    private fun styleSecondarySubmitState(button: Button) {
+        val enabled = canSubmitLogin()
+        button.alpha = if (enabled) 1f else 0.68f
+        button.setTextColor(if (enabled) P.primary else P.muted)
+        button.background = rounded(if (enabled) P.primaryLight else P.surfaceAlt, dp(8), if (enabled) adjustAlpha(P.primary, 0.18f) else P.softLine)
+    }
+
     private fun renderDeviceBinding(): View {
         return screenPage(showBottomPadding = false) {
-            addView(pageHeader("设备绑定", "请扫描并连接 DR-Z-T0 蓝牙设备"))
+            addView(pageHeader("设备绑定", "请扫描并连接 WM-SP# 蓝牙设备"))
             addView(bluetoothConnectionPanel())
             addSpace(12)
             addView(
@@ -693,6 +916,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun continueAfterLogin() {
+        if (!ensureLoginConsentReady()) {
+            return
+        }
+        saveLoginConsentState()
         profileStep = 1
         if (isProfileCompleted()) {
             routeAfterLogin()
@@ -749,7 +976,16 @@ class MainActivity : AppCompatActivity() {
             runCatching {
                 Period.between(LocalDate.parse(child.birthDate), LocalDate.now()).years
             }.getOrDefault(child.age)
-        return "${years.coerceAtLeast(0)}岁"
+        val age = years.coerceAtLeast(0)
+        return languageText(
+            "${age}岁",
+            "$age years old",
+            "${age}歳",
+            "${age}세",
+            "$age años",
+            "$age ans",
+            "$age Jahre",
+        )
     }
 
     private fun renderProfileWizard(): View {
@@ -894,6 +1130,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun LinearLayout.addHomePage() {
+        loadAlerts()
         loadHomeWearData()
         loadGrowthLogs()
         loadSkinLogs()
@@ -921,7 +1158,15 @@ class MainActivity : AppCompatActivity() {
                     cardHeader(
                         "近30天佩戴",
                         thirtyDaySummary?.let {
-                            "平均 ${formatHours(it.avgHours)}/${formatHours(it.prescribedHours)} h · 有数据${it.daysCounted}天"
+                            languageText(
+                                "平均 ${formatHours(it.avgHours)}/${formatHours(it.prescribedHours)} h · 有数据${it.daysCounted}天",
+                                "Avg ${formatHours(it.avgHours)}/${formatHours(it.prescribedHours)} h · ${it.daysCounted} data days",
+                                "平均 ${formatHours(it.avgHours)}/${formatHours(it.prescribedHours)} h · データ${it.daysCounted}日",
+                                "평균 ${formatHours(it.avgHours)}/${formatHours(it.prescribedHours)} h · 데이터 ${it.daysCounted}일",
+                                "Media ${formatHours(it.avgHours)}/${formatHours(it.prescribedHours)} h · ${it.daysCounted} días con datos",
+                                "Moy. ${formatHours(it.avgHours)}/${formatHours(it.prescribedHours)} h · ${it.daysCounted} jours avec données",
+                                "Schnitt ${formatHours(it.avgHours)}/${formatHours(it.prescribedHours)} h · ${it.daysCounted} Datentage",
+                            )
                         } ?: "正在读取云端数据",
                         chip("达标率 ${thirtyDayCompliance}%", thirtyDayChipColor),
                     ),
@@ -929,7 +1174,7 @@ class MainActivity : AppCompatActivity() {
                 addView(
                     horizontal {
                         gravity = Gravity.CENTER_VERTICAL
-                        addView(ProgressRingView(this@MainActivity, thirtyDayCompliance, "达标率", thirtyDayChipColor), squareLp(dp(118)))
+                        addView(ProgressRingView(this@MainActivity, thirtyDayCompliance, uiText("达标率"), thirtyDayChipColor), squareLp(dp(118)))
                         addSpace(14, horizontal = true)
                         addView(
                             vertical {
@@ -939,9 +1184,9 @@ class MainActivity : AppCompatActivity() {
                                 addView(
                                     metricGrid(
                                         listOf(
-                                            "${thirtyDaySummary?.longestStreak ?: 0}天" to "最长连续达标",
-                                            "${thirtyDaySummary?.daysCounted ?: 0}天" to "近30天有数据",
-                                            "${wearCloudRecords.size}天" to "历史记录",
+                                            dayCount(thirtyDaySummary?.longestStreak ?: 0) to "最长连续达标",
+                                            dayCount(thirtyDaySummary?.daysCounted ?: 0) to "近30天有数据",
+                                            dayCount(wearCloudRecords.size) to "历史记录",
                                         ),
                                         itemHeightDp = 92,
                                         valueSize = 18f,
@@ -964,7 +1209,15 @@ class MainActivity : AppCompatActivity() {
                         if (trendRecords.isEmpty()) {
                             "暂无云端数据"
                         } else {
-                            "平均${formatHours(trendSummary.avgHours)}h · 达标${trendRecords.count { isWearCompliant(it) }}/${trendRecords.size}天"
+                            languageText(
+                                "平均${formatHours(trendSummary.avgHours)}h · 达标${trendRecords.count { isWearCompliant(it) }}/${trendRecords.size}天",
+                                "Avg ${formatHours(trendSummary.avgHours)}h · met ${trendRecords.count { isWearCompliant(it) }}/${trendRecords.size} days",
+                                "平均${formatHours(trendSummary.avgHours)}h · 達成${trendRecords.count { isWearCompliant(it) }}/${trendRecords.size}日",
+                                "평균 ${formatHours(trendSummary.avgHours)}h · 달성 ${trendRecords.count { isWearCompliant(it) }}/${trendRecords.size}일",
+                                "Media ${formatHours(trendSummary.avgHours)}h · cumple ${trendRecords.count { isWearCompliant(it) }}/${trendRecords.size} días",
+                                "Moy. ${formatHours(trendSummary.avgHours)}h · atteint ${trendRecords.count { isWearCompliant(it) }}/${trendRecords.size} jours",
+                                "Schnitt ${formatHours(trendSummary.avgHours)}h · erfüllt ${trendRecords.count { isWearCompliant(it) }}/${trendRecords.size} Tage",
+                            )
                         },
                         chip(if (wearCloudLoadedChildId == child.id) "云端数据" else "读取中", if (trendRecords.isEmpty()) P.warning else P.primary),
                     ),
@@ -1003,7 +1256,7 @@ class MainActivity : AppCompatActivity() {
         addView(
             card {
                 addView(cardHeader("历史趋势", "佩戴统计", null))
-                addView(metricGrid(listOf("17.5h" to "35天日均", "46%" to "总体达标率", "3天" to "最长连续")))
+                addView(metricGrid(listOf("17.5h" to "35天日均", "46%" to "总体达标率", dayCount(3) to "最长连续")))
             },
         )
     }
@@ -1012,7 +1265,21 @@ class MainActivity : AppCompatActivity() {
         loadHomeWearData()
         loadGrowthLogs()
         loadSkinLogs()
-        addView(appHeader("咨询", "当前：${child.nickname}(已关联档案)", showBell = true))
+        addView(
+            appHeader(
+                "咨询",
+                languageText(
+                    "当前：${child.nickname}(已关联档案)",
+                    "Current: ${child.nickname} (profile linked)",
+                    "現在：${child.nickname}（プロフィール連携済み）",
+                    "현재: ${child.nickname}(프로필 연결됨)",
+                    "Actual: ${child.nickname} (perfil vinculado)",
+                    "Actuel : ${child.nickname} (dossier lié)",
+                    "Aktuell: ${child.nickname} (Profil verknüpft)",
+                ),
+                showBell = true,
+            ),
+        )
         addView(
             card {
                 addView(cardHeader("常见问题", "近35天云端数据已注入", chip("个性化", P.success)))
@@ -1202,7 +1469,16 @@ class MainActivity : AppCompatActivity() {
         val lowStreak = longestStreakWhere(monthRecords) { target > 0.0 && it.wornHours < target * 0.8 }
         val insights = mutableListOf<String>()
 
-        insights += "近7天平均${formatHours(weekSummary.avgHours)}h/天，医嘱${formatHours(target)}h/天，达标${weekRecords.count { isWearCompliant(it) }}/${weekRecords.size}天，达标率${weekSummary.complianceRate}%。"
+        val weekCompliantDays = weekRecords.count { isWearCompliant(it) }
+        insights += languageText(
+            "近7天平均${formatHours(weekSummary.avgHours)}h/天，医嘱${formatHours(target)}h/天，达标${weekCompliantDays}/${weekRecords.size}天，达标率${weekSummary.complianceRate}%。",
+            "7-day average ${formatHours(weekSummary.avgHours)}h/day, prescribed ${formatHours(target)}h/day, met ${weekCompliantDays}/${weekRecords.size} days, compliance ${weekSummary.complianceRate}%.",
+            "7日平均${formatHours(weekSummary.avgHours)}h/日、指示${formatHours(target)}h/日、達成${weekCompliantDays}/${weekRecords.size}日、達成率${weekSummary.complianceRate}%。",
+            "7일 평균 ${formatHours(weekSummary.avgHours)}h/일, 처방 ${formatHours(target)}h/일, 달성 ${weekCompliantDays}/${weekRecords.size}일, 달성률 ${weekSummary.complianceRate}%.",
+            "Media 7 días ${formatHours(weekSummary.avgHours)}h/día, prescrito ${formatHours(target)}h/día, cumple ${weekCompliantDays}/${weekRecords.size} días, cumplimiento ${weekSummary.complianceRate}%.",
+            "Moyenne 7 jours ${formatHours(weekSummary.avgHours)}h/jour, prescription ${formatHours(target)}h/jour, atteint ${weekCompliantDays}/${weekRecords.size} jours, observance ${weekSummary.complianceRate}%.",
+            "7-Tage-Schnitt ${formatHours(weekSummary.avgHours)}h/Tag, verordnet ${formatHours(target)}h/Tag, erfüllt ${weekCompliantDays}/${weekRecords.size} Tage, Erfüllung ${weekSummary.complianceRate}%.",
+        )
         previousWeekRecords.takeIf { it.isNotEmpty() }?.let { previous ->
             val previousAvg = roundOne(previous.sumOf(WearRecord::wornHours) / previous.size)
             val delta = roundOne(weekSummary.avgHours - previousAvg)
@@ -1260,7 +1536,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun formatDateCn(date: LocalDate): String =
-        "${date.monthValue}月${date.dayOfMonth}日"
+        languageText(
+            "${date.monthValue}月${date.dayOfMonth}日",
+            "${date.dayOfMonth}/${date.monthValue}",
+            "${date.monthValue}月${date.dayOfMonth}日",
+            "${date.monthValue}월 ${date.dayOfMonth}일",
+            "${date.dayOfMonth}/${date.monthValue}",
+            "${date.dayOfMonth}/${date.monthValue}",
+            "${date.dayOfMonth}.${date.monthValue}.",
+        )
+
+    private fun dayCount(days: Int): String =
+        languageText(
+            "${days}天",
+            "${days}d",
+            "${days}日",
+            "${days}일",
+            "${days} d",
+            "${days} j",
+            "${days} T",
+        )
 
     private fun LinearLayout.addVisitReport() {
         loadVisitReportWearData()
@@ -1492,6 +1787,85 @@ class MainActivity : AppCompatActivity() {
         }
         return result.sortedByDescending { it.createdAt }
     }
+
+    private fun loadAlerts(force: Boolean = false) {
+        val targetChildId = child.id
+        if (!force && (alertsLoading || alertsLoadedChildId == targetChildId || alertsLastRequestChildId == targetChildId)) {
+            return
+        }
+        alertsLoading = true
+        alertsLastRequestChildId = targetChildId
+        alertsStatusMessage = null
+        thread(name = "SpinecareAlertsFetch") {
+            runCatching {
+                parseAlerts(getJson(ApiConfig.endpoint("/api/v1/alerts?child_id=${urlEncode(targetChildId)}")))
+            }.onSuccess { items ->
+                mainHandler.post {
+                    if (targetChildId != child.id) {
+                        alertsLoading = false
+                        return@post
+                    }
+                    alertItems = items
+                    alertsLoadedChildId = targetChildId
+                    alertsLastRequestChildId = null
+                    alertsLoading = false
+                    alertsStatusMessage = null
+                    if (stage == Stage.App && (currentTab == MainTab.Home || currentTab == MainTab.Me || currentTab == MainTab.Alerts)) {
+                        render()
+                    }
+                }
+            }.onFailure {
+                mainHandler.post {
+                    if (targetChildId != child.id) {
+                        alertsLoading = false
+                        return@post
+                    }
+                    alertsLastRequestChildId = null
+                    alertsLoading = false
+                    alertsStatusMessage = "消息读取失败，请稍后重试。"
+                    if (stage == Stage.App && (currentTab == MainTab.Me || currentTab == MainTab.Alerts)) {
+                        render()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun parseAlerts(json: JSONObject): List<AlertItem> {
+        val items = json.optJSONArray("items") ?: JSONArray()
+        val result = mutableListOf<AlertItem>()
+        for (index in 0 until items.length()) {
+            val item = items.optJSONObject(index) ?: continue
+            val id = item.optString("id").takeIf { it.isNotBlank() } ?: "alert-$index"
+            result +=
+                AlertItem(
+                    id = id,
+                    type = item.optString("type"),
+                    level = item.optString("level"),
+                    title = item.optString("title").ifBlank { "消息提醒" },
+                    summary = item.optString("summary"),
+                    triggerDetail = item.optString("trigger_detail"),
+                    status = item.optString("status"),
+                    createdAt = item.optString("created_at"),
+                )
+        }
+        return result.sortedWith(compareBy<AlertItem> { alertLevelRank(it.level) }.thenByDescending { it.createdAt })
+    }
+
+    private fun alertCenterSummaryText(): String =
+        when {
+            alertsLoading -> "正在读取消息"
+            alertsStatusMessage != null -> alertsStatusMessage ?: "消息读取失败"
+            alertsLoadedChildId == child.id -> {
+                val pending = unreadAlertCount()
+                when {
+                    pending > 0 -> "${pending}条待处理消息"
+                    alertItems.isEmpty() -> "暂无消息"
+                    else -> "${alertItems.size}条消息已查看"
+                }
+            }
+            else -> "点击查看消息"
+        }
 
     private fun archiveAiReports() {
         if (wearCloudLoading || skinCloudLoading || growthCloudLoading || imagingCloudLoading) {
@@ -2215,7 +2589,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(12), dp(12), dp(12), dp(12))
             addView(
                 TextView(this@MainActivity).apply {
-                    text = "片"
+                    text = uiText("片")
                     textSize = 16f
                     typeface = Typeface.DEFAULT_BOLD
                     gravity = Gravity.CENTER
@@ -2272,6 +2646,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun LinearLayout.addMePage() {
+        loadAlerts()
         addView(appHeader("我的", "档案、设备与隐私", showBell = true))
         addView(
             card {
@@ -2298,7 +2673,8 @@ class MainActivity : AppCompatActivity() {
         addSpace(12)
         addView(
             card {
-                addView(settingRow("消息中心", "2条未读预警", "查看") {
+                addView(settingRow("消息中心", alertCenterSummaryText(), "查看") {
+                    alertsBackTarget = MainTab.Me
                     currentTab = MainTab.Alerts
                     render()
                 })
@@ -2308,7 +2684,7 @@ class MainActivity : AppCompatActivity() {
         addView(
             card {
                 addView(cardHeader("孩子模式", "青少年向成就视图", chip("成就", P.primary)))
-                addView(label("今日佩戴进度、连续达标天数和阶段徽章会以青少年视角呈现。", 15f, P.secondary))
+                addView(label("根据云端真实佩戴数据生成今日进度、连续达标和阶段徽章，适合孩子自己查看。", 15f, P.secondary))
                 addSpace(12)
                 addView(primaryButton("进入孩子模式") {
                     currentTab = MainTab.ChildMode
@@ -2645,6 +3021,10 @@ class MainActivity : AppCompatActivity() {
                     },
                 )
                 addSpace(14)
+                addView(infoStrip(localizedCompanyLine()))
+                addSpace(8)
+                addView(infoStrip(localizedAddressLine()))
+                addSpace(8)
                 addView(infoStrip(localizedEmailLine()))
                 addSpace(8)
                 addView(infoStrip(localizedContactTips()))
@@ -2689,18 +3069,22 @@ class MainActivity : AppCompatActivity() {
     private fun userManualSections(): List<Pair<String, String>> =
         languagePairs(
             zh = listOf(
-                "快速开始" to "登录后按建档向导完善昵称、性别、出生日期、Cobb角、弯曲部位、Risser征、医嘱佩戴时间、支具类型和初诊日期。建档信息会同步到云端，用于首页、报告和AI解读。",
-                "蓝牙设备绑定" to "进入设置页，打开蓝牙连接，扫描名称以 DR-Z-T0 开头的设备。连接成功后APP会保存设备，下次打开时会自动尝试连接上一次设备。",
-                "读取佩戴数据" to "蓝牙连接成功后，APP会自动读取设备佩戴数据并上传云端。界面会提示“正在读取设备数据，请稍候”，完成后提示“数据读取完成”。",
-                "首页数据解读" to "首页近30天佩戴和近7天佩戴均来自云端真实数据，达标标准取自建档中的医嘱佩戴时间。颜色会按达标程度分档提示风险。",
-                "记录功能" to "皮肤记录用于发现问题时拍照和备注；生长记录用于录入身高；影像档案用于保存拍照或图库选择的影像资料。相关内容会进入复诊报告。",
-                "报告与归档" to "AI报告、复诊报告和归档均基于云端佩戴、皮肤、生长、影像及建档信息生成。归档会保存生成当时的数据快照，后续数据变化不会改写已归档报告。",
-                "导出与删除" to "导出数据用于删除前备份。删除全部数据前必须先导出备份、勾选确认项、输入孩子昵称和确认文字，并经过冷静期，避免误删除。",
-                "语言与设置" to "设置页可切换语言并管理蓝牙连接。语言选择会保存到本机，后续打开APP时继续沿用。",
+                "一、产品简介" to "Spinecare Mom 是用于脊柱侧弯支具佩戴管理的 Android APP，帮助监护人记录孩子建档信息、蓝牙支具传感器佩戴数据、皮肤问题、生长记录、影像档案、AI报告、复诊报告和归档资料。本APP由绍兴维脉科技有限公司提供服务。",
+                "二、使用前准备" to "请准备 Android 手机、可用网络、WM-SP# 前缀蓝牙设备以及医生或支具师提供的建档信息。首次使用建议由监护人操作，并确认已了解隐私政策、用户协议和医疗免责声明。",
+                "三、首次使用流程" to "打开APP后登录或注册，按建档向导完善昵称、性别、出生日期、Cobb角、弯曲部位、Risser征、医嘱佩戴时间、支具类型和初诊日期。建档信息会同步到云端，用于首页统计、报告和AI解读。",
+                "四、蓝牙设备绑定" to "进入设置页，打开蓝牙连接，扫描名称以 WM-SP# 开头的设备。连接成功后APP会保存设备，下次打开时自动尝试连接上一次设备；如20秒未发现设备，会提示到设置界面重新扫描连接。",
+                "五、读取佩戴数据" to "蓝牙连接成功后，APP会自动读取设备佩戴数据并上传云端。界面会提示“正在读取设备数据，请稍候”，完成后提示“数据读取完成”。上传成功后会自动清除设备端已存储的佩戴数据。",
+                "六、首页数据解读" to "首页近30天佩戴和近7天佩戴均来自云端真实数据，达标标准取自建档中的医嘱佩戴时间。条形图、圆形达标率和智能解读会按达标程度分档提示风险。",
+                "七、记录功能" to "皮肤记录用于发现发红、疼痛、破皮、水泡等问题时拍照和备注；问题部位和问题类型可多选。生长记录用于录入身高并查看趋势；影像档案用于拍照或从手机图库选择影像资料。相关内容会进入复诊报告。",
+                "八、报告与归档" to "AI报告、复诊报告和归档均基于云端佩戴、皮肤、生长、影像及建档信息生成。归档会保存生成当时的数据快照，后续数据变化不会自动改写已归档报告。",
+                "九、导出与删除" to "导出数据用于删除前备份。删除全部数据前必须先导出备份、勾选确认项、输入孩子昵称和确认文字，并经过冷静期，避免误删除。删除完成后云端数据不可恢复。",
+                "十、语言与设置" to "设置页可切换中文、英文、日语、韩语、西班牙语、法语、德语，并可管理蓝牙连接。语言选择会保存到本机，后续打开APP时继续沿用。",
+                "十一、医疗安全提示" to "本APP用于家庭佩戴管理和复诊资料整理，不提供诊断、处方或支具调整结论。出现疼痛、皮肤破损、麻木、呼吸不适或其他紧急情况时，应及时联系医生或支具师。",
+                "十二、联系方式" to "运营主体：绍兴维脉科技有限公司；地址：浙江省绍兴市越城区袍中北路631号；邮箱：zclei@vip.sina.com。可在“联系我们”页面扫描微信二维码添加客服。",
             ),
             en = listOf(
                 "Quick Start" to "After login, complete the profile wizard: nickname, gender, birth date, Cobb angle, curve location, Risser sign, prescribed wearing hours, brace type, and first visit date. The profile is synced to the cloud for the home page, reports, and AI interpretation.",
-                "Bluetooth Device Binding" to "Open Settings, enter Bluetooth Connection, and scan for devices whose names start with DR-Z-T0. After a successful connection, the app saves the device and will try to reconnect to it next time.",
+                "Bluetooth Device Binding" to "Open Settings, enter Bluetooth Connection, and scan for devices whose names start with WM-SP#. After a successful connection, the app saves the device and will try to reconnect to it next time.",
                 "Read Wearing Data" to "After Bluetooth connects, the app automatically reads wearing data from the device and uploads it to the cloud. It shows Reading device data, please wait, and then Data reading complete.",
                 "Home Data Insights" to "The 30-day wearing summary and 7-day wearing chart on the home page use real cloud data. The target standard comes from the prescribed wearing hours in the profile, and colors indicate risk levels.",
                 "Record Features" to "Skin records are used for photos and notes when a problem is found. Growth records store height. Imaging archives save photos taken by the camera or selected from the phone gallery. These records are included in visit reports.",
@@ -2710,7 +3094,7 @@ class MainActivity : AppCompatActivity() {
             ),
             ja = listOf(
                 "クイックスタート" to "ログイン後、プロフィール作成ウィザードでニックネーム、性別、生年月日、Cobb角、弯曲部位、Risser徴候、医師指示の装着時間、装具タイプ、初診日を入力します。情報はクラウドに同期され、ホーム、レポート、AI解釈に使われます。",
-                "Bluetooth機器の登録" to "設定でBluetooth接続を開き、名前が DR-Z-T0 で始まる機器をスキャンします。接続に成功すると機器が保存され、次回起動時に自動再接続を試みます。",
+                "Bluetooth機器の登録" to "設定でBluetooth接続を開き、名前が WM-SP# で始まる機器をスキャンします。接続に成功すると機器が保存され、次回起動時に自動再接続を試みます。",
                 "装着データの読み取り" to "Bluetooth接続後、アプリは機器内の装着データを自動で読み取りクラウドへアップロードします。画面にはデータ読み取り中の案内と完了案内が表示されます。",
                 "ホームデータの見方" to "ホームの30日装着サマリーと7日装着グラフはクラウドの実データを使用します。達成基準はプロフィールの医師指示装着時間で、色分けでリスクを示します。",
                 "記録機能" to "皮膚記録は問題発見時の写真とメモに使います。成長記録は身長を保存し、画像記録は撮影またはギャラリー選択の画像を保存します。これらは再診レポートに反映されます。",
@@ -2720,7 +3104,7 @@ class MainActivity : AppCompatActivity() {
             ),
             ko = listOf(
                 "빠른 시작" to "로그인 후 프로필 마법사에서 닉네임, 성별, 생년월일, Cobb 각도, 만곡 부위, Risser 징후, 처방 착용 시간, 보조기 종류, 초진일을 입력합니다. 프로필은 클라우드에 동기화되어 홈, 보고서, AI 해석에 사용됩니다.",
-                "Bluetooth 장치 등록" to "설정에서 Bluetooth 연결을 열고 이름이 DR-Z-T0 로 시작하는 장치를 스캔합니다. 연결에 성공하면 앱이 장치를 저장하고 다음 실행 시 자동 재연결을 시도합니다.",
+                "Bluetooth 장치 등록" to "설정에서 Bluetooth 연결을 열고 이름이 WM-SP# 로 시작하는 장치를 스캔합니다. 연결에 성공하면 앱이 장치를 저장하고 다음 실행 시 자동 재연결을 시도합니다.",
                 "착용 데이터 읽기" to "Bluetooth가 연결되면 앱은 장치의 착용 데이터를 자동으로 읽어 클라우드에 업로드합니다. 화면에는 장치 데이터 읽는 중 안내와 완료 안내가 표시됩니다.",
                 "홈 데이터 해석" to "홈의 30일 착용 요약과 7일 착용 차트는 클라우드 실제 데이터를 사용합니다. 목표 기준은 프로필의 처방 착용 시간이며, 색상으로 위험 수준을 표시합니다.",
                 "기록 기능" to "피부 기록은 문제가 발견될 때 사진과 메모를 남기는 기능입니다. 성장 기록은 키를 저장하고, 영상 기록은 촬영 또는 갤러리 선택 이미지를 저장합니다. 관련 내용은 재진 보고서에 포함됩니다.",
@@ -2730,7 +3114,7 @@ class MainActivity : AppCompatActivity() {
             ),
             es = listOf(
                 "Inicio rápido" to "Después de iniciar sesión, completa el asistente de perfil: apodo, sexo, fecha de nacimiento, ángulo Cobb, zona de curva, signo Risser, horas prescritas, tipo de corsé y fecha de primera visita. El perfil se sincroniza con la nube para inicio, informes e interpretación de IA.",
-                "Vinculación Bluetooth" to "Abre Ajustes, entra en Conexión Bluetooth y busca dispositivos cuyo nombre empiece por DR-Z-T0. Tras conectarse, la app guarda el dispositivo e intentará reconectarlo la próxima vez.",
+                "Vinculación Bluetooth" to "Abre Ajustes, entra en Conexión Bluetooth y busca dispositivos cuyo nombre empiece por WM-SP#. Tras conectarse, la app guarda el dispositivo e intentará reconectarlo la próxima vez.",
                 "Leer datos de uso" to "Después de conectar Bluetooth, la app lee automáticamente los datos de uso del dispositivo y los sube a la nube. La pantalla muestra que está leyendo datos y avisa cuando termina.",
                 "Lectura de datos de inicio" to "El resumen de 30 días y el gráfico de 7 días usan datos reales de la nube. El estándar de cumplimiento viene de las horas prescritas del perfil y los colores indican niveles de riesgo.",
                 "Funciones de registro" to "El registro de piel sirve para fotos y notas cuando aparece un problema. Crecimiento guarda la altura. Imagen guarda fotos tomadas con la cámara o elegidas de la galería. Todo se integra en el informe de revisión.",
@@ -2740,7 +3124,7 @@ class MainActivity : AppCompatActivity() {
             ),
             fr = listOf(
                 "Démarrage rapide" to "Après connexion, complétez l'assistant de dossier : surnom, sexe, date de naissance, angle de Cobb, zone de courbure, signe de Risser, heures de port prescrites, type d'orthèse et date de première consultation. Le dossier est synchronisé dans le cloud pour l'accueil, les rapports et l'analyse IA.",
-                "Association Bluetooth" to "Ouvrez Paramètres, puis Connexion Bluetooth, et recherchez les appareils dont le nom commence par DR-Z-T0. Après connexion, l'application enregistre l'appareil et tentera de s'y reconnecter au prochain lancement.",
+                "Association Bluetooth" to "Ouvrez Paramètres, puis Connexion Bluetooth, et recherchez les appareils dont le nom commence par WM-SP#. Après connexion, l'application enregistre l'appareil et tentera de s'y reconnecter au prochain lancement.",
                 "Lire les données de port" to "Après connexion Bluetooth, l'application lit automatiquement les données de port de l'appareil et les envoie au cloud. L'écran indique la lecture en cours puis la fin de la lecture.",
                 "Analyse de l'accueil" to "Le résumé sur 30 jours et le graphique sur 7 jours utilisent les données réelles du cloud. Le seuil vient des heures prescrites dans le dossier, et les couleurs indiquent le niveau de risque.",
                 "Fonctions de suivi" to "Le suivi de peau sert aux photos et notes lorsqu'un problème apparaît. Le suivi de croissance enregistre la taille. Le dossier d'imagerie conserve les photos prises ou choisies dans la galerie. Ces éléments sont intégrés au rapport de suivi.",
@@ -2750,7 +3134,7 @@ class MainActivity : AppCompatActivity() {
             ),
             de = listOf(
                 "Schnellstart" to "Nach der Anmeldung füllen Sie den Profilassistenten aus: Spitzname, Geschlecht, Geburtsdatum, Cobb-Winkel, Krümmungsbereich, Risser-Zeichen, verordnete Tragezeit, Orthesentyp und Datum der Erstuntersuchung. Das Profil wird mit der Cloud synchronisiert und für Startseite, Berichte und KI-Auswertung genutzt.",
-                "Bluetooth-Gerät koppeln" to "Öffnen Sie Einstellungen und Bluetooth-Verbindung, und suchen Sie nach Geräten, deren Name mit DR-Z-T0 beginnt. Nach erfolgreicher Verbindung speichert die App das Gerät und versucht beim nächsten Start eine automatische Wiederverbindung.",
+                "Bluetooth-Gerät koppeln" to "Öffnen Sie Einstellungen und Bluetooth-Verbindung, und suchen Sie nach Geräten, deren Name mit WM-SP# beginnt. Nach erfolgreicher Verbindung speichert die App das Gerät und versucht beim nächsten Start eine automatische Wiederverbindung.",
                 "Tragedaten lesen" to "Nach der Bluetooth-Verbindung liest die App automatisch die Tragedaten vom Gerät und lädt sie in die Cloud hoch. Die Oberfläche zeigt das Lesen der Gerätedaten und danach den Abschluss an.",
                 "Startseitenanalyse" to "Die 30-Tage-Zusammenfassung und das 7-Tage-Diagramm verwenden echte Cloud-Daten. Der Zielwert stammt aus der verordneten Tragezeit im Profil, Farben zeigen Risikostufen.",
                 "Aufzeichnungsfunktionen" to "Hautprotokolle dienen Fotos und Notizen bei Problemen. Wachstumsprotokolle speichern die Körpergröße. Das Bildarchiv speichert Kamera- oder Galerieaufnahmen. Diese Inhalte fließen in den Kontrollbericht ein.",
@@ -2764,7 +3148,7 @@ class MainActivity : AppCompatActivity() {
         languagePairs(
             zh = listOf(
                 "为什么需要先绑定蓝牙设备？" to "支具传感器中的佩戴数据需要通过蓝牙读取。绑定后APP才能自动连接设备并上传佩戴记录。",
-                "蓝牙连接不上怎么办？" to "请确认手机蓝牙已打开、设备在附近且设备名称以 DR-Z-T0 开头。如果20秒内未发现上次设备，请到设置页重新扫描连接。",
+                "蓝牙连接不上怎么办？" to "请确认手机蓝牙已打开、设备在附近且设备名称以 WM-SP# 开头。如果20秒内未发现上次设备，请到设置页重新扫描连接。",
                 "首页达标率如何计算？" to "达标率按统计周期内达到医嘱佩戴时长的天数占比计算。医嘱佩戴时长来自建档信息。",
                 "佩戴数据什么时候上传云端？" to "蓝牙连接成功并读取设备数据后，APP会自动上传云端。上传成功后会自动清除设备端已存储的佩戴数据。",
                 "皮肤记录是否需要每天填写？" to "不需要每天检查打卡。仅在发现发红、疼痛、破皮、水泡等问题时拍照并填写记录。",
@@ -2775,7 +3159,7 @@ class MainActivity : AppCompatActivity() {
             ),
             en = listOf(
                 "Why bind a Bluetooth device first?" to "Wearing data stored in the brace sensor must be read through Bluetooth. After binding, the app can connect automatically and upload wearing records.",
-                "What if Bluetooth cannot connect?" to "Make sure phone Bluetooth is on, the device is nearby, and the name starts with DR-Z-T0. If the last device is not found within 20 seconds, scan and connect again in Settings.",
+                "What if Bluetooth cannot connect?" to "Make sure phone Bluetooth is on, the device is nearby, and the name starts with WM-SP#. If the last device is not found within 20 seconds, scan and connect again in Settings.",
                 "How is the home compliance rate calculated?" to "Compliance rate is the percentage of days in the selected period that meet the prescribed wearing hours. The prescribed hours come from the profile.",
                 "When is wearing data uploaded?" to "After Bluetooth connects and the device data is read, the app uploads it to the cloud automatically. After a successful upload, stored device records are cleared.",
                 "Do skin records need daily check-in?" to "No. Record only when redness, pain, skin breakage, blisters, or other problems are found.",
@@ -2786,7 +3170,7 @@ class MainActivity : AppCompatActivity() {
             ),
             ja = listOf(
                 "なぜ先にBluetooth機器を登録する必要がありますか？" to "装具センサー内の装着データはBluetoothで読み取る必要があります。登録後、アプリは自動接続して装着記録をアップロードできます。",
-                "Bluetoothに接続できない場合は？" to "スマートフォンのBluetoothがオンで、機器が近くにあり、名前が DR-Z-T0 で始まることを確認してください。20秒以内に前回機器が見つからない場合は、設定で再スキャンしてください。",
+                "Bluetoothに接続できない場合は？" to "スマートフォンのBluetoothがオンで、機器が近くにあり、名前が WM-SP# で始まることを確認してください。20秒以内に前回機器が見つからない場合は、設定で再スキャンしてください。",
                 "ホームの達成率はどのように計算しますか？" to "達成率は、対象期間内で医師指示の装着時間に達した日数の割合です。指示時間はプロフィールから取得します。",
                 "装着データはいつクラウドに送信されますか？" to "Bluetooth接続後に機器データを読み取ると、アプリが自動でクラウドへ送信します。送信成功後、機器内の保存済み記録を消去します。",
                 "皮膚記録は毎日必要ですか？" to "毎日は不要です。発赤、痛み、皮膚損傷、水疱などを見つけた時だけ記録してください。",
@@ -2797,7 +3181,7 @@ class MainActivity : AppCompatActivity() {
             ),
             ko = listOf(
                 "왜 Bluetooth 장치를 먼저 등록해야 하나요?" to "보조기 센서의 착용 데이터는 Bluetooth로 읽어야 합니다. 등록 후 앱이 자동으로 장치에 연결하고 착용 기록을 업로드할 수 있습니다.",
-                "Bluetooth가 연결되지 않으면 어떻게 하나요?" to "휴대폰 Bluetooth가 켜져 있고 장치가 가까이에 있으며 이름이 DR-Z-T0 로 시작하는지 확인하세요. 20초 안에 이전 장치를 찾지 못하면 설정에서 다시 스캔하세요.",
+                "Bluetooth가 연결되지 않으면 어떻게 하나요?" to "휴대폰 Bluetooth가 켜져 있고 장치가 가까이에 있으며 이름이 WM-SP# 로 시작하는지 확인하세요. 20초 안에 이전 장치를 찾지 못하면 설정에서 다시 스캔하세요.",
                 "홈의 달성률은 어떻게 계산하나요?" to "달성률은 통계 기간 중 처방 착용 시간을 달성한 날의 비율입니다. 처방 시간은 프로필 정보에서 가져옵니다.",
                 "착용 데이터는 언제 업로드되나요?" to "Bluetooth 연결 후 장치 데이터를 읽으면 앱이 자동으로 클라우드에 업로드합니다. 업로드 성공 후 장치에 저장된 기록은 자동 삭제됩니다.",
                 "피부 기록을 매일 해야 하나요?" to "아니요. 발적, 통증, 피부 손상, 물집 등 문제가 발견될 때만 기록하면 됩니다.",
@@ -2808,7 +3192,7 @@ class MainActivity : AppCompatActivity() {
             ),
             es = listOf(
                 "¿Por qué vincular primero un dispositivo Bluetooth?" to "Los datos del sensor del corsé deben leerse por Bluetooth. Tras vincularlo, la app puede conectarse automáticamente y subir los registros.",
-                "¿Qué hago si Bluetooth no conecta?" to "Comprueba que Bluetooth del teléfono esté activado, el dispositivo esté cerca y el nombre empiece por DR-Z-T0. Si no aparece en 20 segundos, vuelve a escanear en Ajustes.",
+                "¿Qué hago si Bluetooth no conecta?" to "Comprueba que Bluetooth del teléfono esté activado, el dispositivo esté cerca y el nombre empiece por WM-SP#. Si no aparece en 20 segundos, vuelve a escanear en Ajustes.",
                 "¿Cómo se calcula el cumplimiento?" to "Es el porcentaje de días del periodo que alcanzan las horas prescritas. Las horas prescritas vienen del perfil.",
                 "¿Cuándo se suben los datos de uso?" to "Después de conectar Bluetooth y leer el dispositivo, la app sube los datos automáticamente. Tras una subida correcta, borra los registros guardados en el dispositivo.",
                 "¿Debo registrar la piel cada día?" to "No. Registra solo cuando aparezcan enrojecimiento, dolor, herida, ampollas u otros problemas.",
@@ -2819,7 +3203,7 @@ class MainActivity : AppCompatActivity() {
             ),
             fr = listOf(
                 "Pourquoi associer d'abord un appareil Bluetooth ?" to "Les données du capteur de l'orthèse doivent être lues par Bluetooth. Après association, l'application peut se connecter automatiquement et envoyer les enregistrements.",
-                "Que faire si Bluetooth ne se connecte pas ?" to "Vérifiez que le Bluetooth du téléphone est activé, que l'appareil est proche et que son nom commence par DR-Z-T0. S'il n'est pas trouvé en 20 secondes, scannez à nouveau dans Paramètres.",
+                "Que faire si Bluetooth ne se connecte pas ?" to "Vérifiez que le Bluetooth du téléphone est activé, que l'appareil est proche et que son nom commence par WM-SP#. S'il n'est pas trouvé en 20 secondes, scannez à nouveau dans Paramètres.",
                 "Comment le taux d'observance est-il calculé ?" to "C'est le pourcentage de jours de la période qui atteignent les heures prescrites. Les heures prescrites viennent du dossier.",
                 "Quand les données de port sont-elles envoyées ?" to "Après connexion Bluetooth et lecture de l'appareil, l'application envoie automatiquement les données. Après succès, elle efface les enregistrements stockés sur l'appareil.",
                 "Faut-il saisir la peau chaque jour ?" to "Non. Saisissez seulement en cas de rougeur, douleur, plaie, ampoule ou autre problème.",
@@ -2830,7 +3214,7 @@ class MainActivity : AppCompatActivity() {
             ),
             de = listOf(
                 "Warum zuerst ein Bluetooth-Gerät koppeln?" to "Die Tragedaten im Orthesensensor müssen per Bluetooth gelesen werden. Nach der Kopplung kann die App automatisch verbinden und Trageaufzeichnungen hochladen.",
-                "Was tun, wenn Bluetooth nicht verbindet?" to "Prüfen Sie, ob Bluetooth am Telefon aktiv ist, das Gerät in der Nähe ist und der Name mit DR-Z-T0 beginnt. Wird das letzte Gerät in 20 Sekunden nicht gefunden, scannen Sie erneut in den Einstellungen.",
+                "Was tun, wenn Bluetooth nicht verbindet?" to "Prüfen Sie, ob Bluetooth am Telefon aktiv ist, das Gerät in der Nähe ist und der Name mit WM-SP# beginnt. Wird das letzte Gerät in 20 Sekunden nicht gefunden, scannen Sie erneut in den Einstellungen.",
                 "Wie wird die Erfüllungsrate berechnet?" to "Sie ist der Anteil der Tage im Zeitraum, an denen die verordnete Tragezeit erreicht wurde. Die verordnete Zeit stammt aus dem Profil.",
                 "Wann werden Tragedaten hochgeladen?" to "Nach Bluetooth-Verbindung und Lesen der Gerätedaten lädt die App automatisch in die Cloud hoch. Nach erfolgreichem Upload werden gespeicherte Gerätedaten gelöscht.",
                 "Muss das Hautprotokoll täglich ausgefüllt werden?" to "Nein. Erfassen Sie nur bei Rötung, Schmerzen, Hautverletzung, Blasen oder anderen Problemen.",
@@ -2844,13 +3228,19 @@ class MainActivity : AppCompatActivity() {
     private fun userAgreementSections(): List<Pair<String, String>> =
         languagePairs(
             zh = listOf(
-                "一、服务说明" to "Spinecare Mom用于帮助监护人记录和查看支具佩戴、皮肤、生长、影像和报告资料。APP提供数据整理、提醒和辅助解读功能。",
-                "二、监护人责任" to "本APP面向未成年人健康管理场景，监护人应确认有权录入和管理相关数据，并应确保录入信息真实、准确、及时更新。",
-                "三、医疗免责声明" to "APP不是医疗诊断工具。AI解读、报告摘要和提醒仅供健康管理参考，不替代医生诊断、医嘱、复诊安排或支具师调整意见。",
-                "四、数据与报告" to "用户上传或同步的数据会用于首页统计、智能解读、复诊报告、归档和导出备份。归档报告保存生成时的数据快照。",
-                "五、用户行为" to "用户不得上传违法、侵权、恶意或与本服务无关的内容，不得尝试破坏服务、绕过安全限制或冒用他人信息。",
-                "六、服务变更" to "产品功能可能根据测试、医疗安全和合规要求调整。涉及重要数据处理规则变化时，应在APP内更新说明。",
-                "七、终止与删除" to "用户可通过导出数据和删除全部数据流程结束使用。删除完成后云端数据不可恢复，建议提前保存备份。",
+                "一、协议说明" to "欢迎使用 Spinecare Mom。本协议由绍兴维脉科技有限公司与您就 Spinecare Mom APP 及相关服务的使用订立。您注册、登录、访问、安装、使用本APP或相关服务，即视为已阅读、理解并同意本协议。",
+                "二、服务内容" to "本APP提供孩子建档、支具蓝牙设备绑定、佩戴数据读取与云端同步、首页统计、皮肤/生长/影像记录、AI辅助解读、复诊报告、归档、导出备份和删除全部数据等服务。",
+                "三、监护人责任" to "本APP面向未成年人健康管理场景。监护人应确认有权录入和管理相关数据，确保所录入的孩子资料、医嘱信息、照片和记录真实、准确、及时更新，并妥善保管手机和账号使用权限。",
+                "四、设备绑定与数据同步" to "用户应使用真实、合法取得的 WM-SP# 前缀蓝牙设备。蓝牙连接后APP会读取佩戴数据并上传云端，上传成功后可清除设备端已存储佩戴数据。因设备未开机、蓝牙异常、网络异常或用户误操作导致的数据缺失，用户应及时检查并重新同步。",
+                "五、医疗免责声明" to "本APP不是医疗诊断、处方或治疗工具。AI解读、报告摘要、颜色预警、复诊资料和提醒仅供家庭健康管理参考，不替代医生诊断、医嘱、复诊安排或支具师调整意见。",
+                "六、数据与报告" to "用户上传或同步的数据会用于首页统计、智能解读、复诊报告、归档和导出备份。归档报告保存生成时的数据快照，后续数据变化不会自动改写已归档报告。",
+                "七、用户行为规范" to "用户不得上传违法、侵权、恶意、虚假或与本服务无关的内容，不得尝试破坏服务、绕过安全限制、冒用他人信息、伪造佩戴数据或干扰云端数据库正常运行。",
+                "八、知识产权" to "本APP及相关系统、页面设计、算法逻辑、界面元素、文案、代码和报告模板等内容的知识产权归绍兴维脉科技有限公司或相关权利人所有。未经书面许可，不得复制、修改、传播、反编译或用于商业用途。",
+                "九、服务变更、中断与终止" to "基于功能维护、版本升级、服务器调整、医疗安全或合规要求，我们可能调整、中断或终止部分服务。涉及重要数据处理规则变化时，应在APP内更新说明或提示用户查看。",
+                "十、隐私与个人信息保护" to "我们将按照《Spinecare Mom APP隐私政策》处理个人信息和未成年人健康相关数据。隐私政策是本协议的重要组成部分，与本协议具有同等效力。",
+                "十一、终止与删除" to "用户可通过导出数据和删除全部数据流程结束使用。删除完成后云端建档、佩戴、皮肤、生长、影像、报告、预警、设备绑定及上传文件不可恢复，建议提前保存备份。",
+                "十二、适用法律与争议解决" to "本协议的订立、履行、解释及争议解决适用中华人民共和国法律。因本协议引起的争议，双方应先友好协商；协商不成的，可向绍兴维脉科技有限公司所在地有管辖权的人民法院提起诉讼。",
+                "十三、联系我们" to "运营主体：绍兴维脉科技有限公司；地址：浙江省绍兴市越城区袍中北路631号；邮箱：zclei@vip.sina.com。也可在APP“联系我们”页面扫描微信二维码添加客服。",
             ),
             en = listOf(
                 "1. Service Description" to "Spinecare Mom helps guardians record and view brace wearing, skin, growth, imaging, and report information. The app provides data organization, reminders, and assisted interpretation.",
@@ -2911,15 +3301,17 @@ class MainActivity : AppCompatActivity() {
     private fun privacyPolicySections(): List<Pair<String, String>> =
         languagePairs(
             zh = listOf(
-                "一、收集的数据" to "APP可能收集建档信息、佩戴记录、蓝牙设备信息、皮肤照片与备注、生长记录、影像资料、AI咨询内容、报告归档和预警消息。",
-                "二、使用目的" to "数据用于展示佩戴趋势、判断达标情况、生成复诊报告、提供智能解读、保存归档、导出备份和执行删除流程。",
-                "三、权限说明" to "蓝牙权限用于连接支具设备；相机和图库权限用于记录皮肤或影像资料；网络权限用于与云端数据库同步。",
-                "四、未成年人保护" to "未成年人数据应由监护人管理。APP尽量减少不必要身份信息采集，默认不要求真实姓名或证件号码。",
-                "五、数据存储" to "数据会保存于项目独立云端数据库和上传目录。本机也会保存语言选择、最近备份时间和上次绑定设备等基础设置。",
-                "六、导出数据" to "导出功能会生成包含主要云端数据的JSON备份文件。请保存到可信位置，并避免随意转发。",
-                "七、删除全部数据" to "删除功能会删除当前孩子相关的云端建档、佩戴、记录、报告、预警、设备绑定和上传文件。删除完成后不可恢复。",
-                "八、第三方共享" to "除用户主动分享、依法要求或服务运行必要外，APP不应将健康数据提供给无关第三方。",
-                "九、政策更新" to "隐私政策可能随功能变更更新。重大变更应在APP中提示用户查看。",
+                "一、引言" to "欢迎使用 Spinecare Mom。我们深知个人信息和未成年人健康相关数据的重要性，并将按照合法、正当、必要、诚信、公开透明的原则处理您的信息。本隐私政策适用于绍兴维脉科技有限公司提供的 Spinecare Mom APP 及相关服务。",
+                "二、我们收集和使用的信息" to "APP可能收集监护人登录信息、孩子建档信息、Cobb角、弯曲部位、Risser征、医嘱佩戴时间、支具类型、初诊日期、蓝牙设备信息、佩戴记录、皮肤照片与备注、生长记录、影像资料、AI咨询内容、报告归档、预警消息、导出与删除流程记录及必要运行日志。",
+                "三、使用目的" to "上述数据用于完成登录与建档、蓝牙设备绑定、读取和上传佩戴数据、展示佩戴趋势、判断达标情况、生成AI报告和复诊报告、保存归档、导出备份、执行删除流程、排查故障及改进服务。",
+                "四、权限说明" to "蓝牙权限用于连接 WM-SP# 前缀支具传感器；相机权限用于拍摄皮肤问题或影像资料；图库权限用于选择手机相册中的影像资料；网络权限用于与云端数据库、上传目录和服务接口同步。",
+                "五、共享、转让和公开披露" to "我们不会向无关第三方出售或非法提供个人信息和健康相关数据。除用户主动分享、依法要求、履行监护人授权、保护用户安全或服务运行必要外，APP不会将健康数据提供给无关第三方。如发生合并、分立、收购或资产转让，我们将要求接收方继续受本政策约束。",
+                "六、存储与保护" to "数据会保存于项目独立云端数据库和上传目录。本机也会保存语言选择、最近备份时间、上次绑定设备等基础设置。我们将采取访问控制、数据库权限管理、日志审计、最小权限原则等合理措施保护数据安全。",
+                "七、未成年人保护" to "本APP主要用于未成年人支具佩戴管理。未成年人数据应由监护人录入和管理。APP尽量减少不必要身份信息采集，默认不要求真实姓名或证件号码。监护人应妥善管理孩子照片、影像和健康记录。",
+                "八、您的权利" to "您可在APP内查看、更正建档信息，导出主要云端数据作为备份，并按“删除全部数据”流程申请删除当前孩子相关云端数据。删除完成后数据不可恢复，请先确认备份文件可打开并妥善保存。",
+                "九、导出与删除" to "导出功能会生成包含主要云端数据的备份文件，请保存到可信位置并避免随意转发。删除功能会删除当前孩子相关的云端建档、佩戴、皮肤、生长、影像、报告、预警、设备绑定和上传文件。",
+                "十、政策更新" to "我们可能根据产品功能、法律法规或运营需要更新本隐私政策。涉及个人信息权益的重要变更时，应在APP中提示用户查看。",
+                "十一、联系我们" to "运营主体：绍兴维脉科技有限公司；地址：浙江省绍兴市越城区袍中北路631号；邮箱：zclei@vip.sina.com。也可在APP“联系我们”页面扫描微信二维码添加客服。",
             ),
             en = listOf(
                 "1. Data Collected" to "The app may collect profile information, wearing records, Bluetooth device information, skin photos and notes, growth records, imaging files, AI consultation content, report archives, and alert messages.",
@@ -3030,6 +3422,28 @@ class MainActivity : AppCompatActivity() {
             "Scannen Sie den QR-Code oben, um den WeChat-Support hinzuzufügen.",
         )
 
+    private fun localizedCompanyLine(): String =
+        languageText(
+            "公司：$COMPANY_NAME_ZH",
+            "Company: Shaoxing Weimai Technology Co., Ltd.",
+            "会社: Shaoxing Weimai Technology Co., Ltd.",
+            "회사: Shaoxing Weimai Technology Co., Ltd.",
+            "Empresa: Shaoxing Weimai Technology Co., Ltd.",
+            "Société : Shaoxing Weimai Technology Co., Ltd.",
+            "Unternehmen: Shaoxing Weimai Technology Co., Ltd.",
+        )
+
+    private fun localizedAddressLine(): String =
+        languageText(
+            "地址：$COMPANY_ADDRESS_ZH",
+            "Address: No. 631, Paozhong North Road, Yuecheng District, Shaoxing, Zhejiang, China",
+            "住所: 中国浙江省紹興市越城区袍中北路631号",
+            "주소: 중국 저장성 사오싱시 웨청구 파오중북로 631호",
+            "Dirección: No. 631, Paozhong North Road, Distrito Yuecheng, Shaoxing, Zhejiang, China",
+            "Adresse : No. 631, Paozhong North Road, district de Yuecheng, Shaoxing, Zhejiang, Chine",
+            "Adresse: Nr. 631, Paozhong North Road, Yuecheng District, Shaoxing, Zhejiang, China",
+        )
+
     private fun localizedEmailLine(): String =
         languageText(
             "邮箱：$CONTACT_EMAIL",
@@ -3100,7 +3514,21 @@ class MainActivity : AppCompatActivity() {
         addSpace(12)
         addView(
             card {
-                addView(cardHeader("APP 语言", "当前：${languages[selectedLanguageIndex]}", chip("7种", P.primary)))
+                addView(
+                    cardHeader(
+                        "APP 语言",
+                        languageText(
+                            "当前：${languages[selectedLanguageIndex]}",
+                            "Current: ${languages[selectedLanguageIndex]}",
+                            "現在：${languages[selectedLanguageIndex]}",
+                            "현재: ${languages[selectedLanguageIndex]}",
+                            "Actual: ${languages[selectedLanguageIndex]}",
+                            "Actuel : ${languages[selectedLanguageIndex]}",
+                            "Aktuell: ${languages[selectedLanguageIndex]}",
+                        ),
+                        chip("7种", P.primary),
+                    ),
+                )
                 addView(infoStrip("界面文字会按照这里的语言显示，选择后立即保存。"))
                 addSpace(8)
                 addView(languageRadioGroup())
@@ -3109,11 +3537,65 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun LinearLayout.addBluetoothValidationPage() {
-        val rows = latestUploadValidationRows
-        val firstPoint = rows.firstOrNull()?.hourStart
-        val firstWearPoint = rows.firstOrNull { it.wornHours > 0.0 }?.hourStart
-        val receivedAt = latestUploadFetchedAt
-        val completedAt = latestUploadCompletedAt
+        val rows = bluetoothValidationDisplayRows()
+        val firstPoint = rows.minOfOrNull { it.hourStart }
+        val hasLatestUploadRows = shouldShowLatestUploadValidationRows()
+        val firstWearPoint =
+            rows.flatMap { row -> row.samples.filter { it.worn }.map { it.recordedAt } }
+                .minOrNull()
+                ?: rows.filter { it.wornHours > 0.0 }.minOfOrNull { it.hourStart }
+        val latestSampleAt =
+            rows.flatMap { row -> row.samples.map { it.recordedAt } }.maxOrNull()
+                ?: rows.maxOfOrNull { it.hourStart }
+        val receivedAt = latestUploadFetchedAt ?: latestSampleAt.takeUnless { hasLatestUploadRows }
+        val completedAt = latestUploadCompletedAt ?: latestSampleAt.takeUnless { hasLatestUploadRows }
+        val cloudLastReadAt = wearCloudRecords.mapNotNull { it.lastReadAt }.maxOrNull()
+        val cloudHistoryRecord =
+            wearCloudRecords
+                .filter { it.historyHead != null || it.historyCount != null }
+                .maxByOrNull { it.lastReadAt ?: it.date.atStartOfDay() }
+        val lastReadAt =
+            if (hasLatestUploadRows || deviceSyncInProgress || deviceSyncUploading) {
+                latestUploadLastReadAt ?: cloudLastReadAt
+            } else {
+                cloudLastReadAt ?: latestUploadLastReadAt
+            }
+        val displayHistoryHead =
+            if (hasLatestUploadRows || deviceSyncInProgress || deviceSyncUploading) {
+                latestUploadHistoryHead ?: cloudHistoryRecord?.historyHead
+            } else {
+                cloudHistoryRecord?.historyHead ?: latestUploadHistoryHead
+            }
+        val displayHistoryCount =
+            if (hasLatestUploadRows || deviceSyncInProgress || deviceSyncUploading) {
+                latestUploadHistoryCount ?: cloudHistoryRecord?.historyCount
+            } else {
+                cloudHistoryRecord?.historyCount ?: latestUploadHistoryCount
+            }
+        val displayStatus =
+            when {
+                deviceSyncInProgress || deviceSyncUploading -> latestUploadStatus
+                hasLatestUploadRows -> latestUploadStatus
+                wearCloudLoading -> "正在读取云端佩戴数据..."
+                rows.isNotEmpty() -> "已显示云端数据库保存数据"
+                else -> latestUploadStatus
+            }
+        val displayDailyCount =
+            if (hasLatestUploadRows) {
+                latestUploadDailyCount
+            } else {
+                rows.map { it.hourStart.toLocalDate() }.distinct().size
+            }
+        val displayTotalWornHours =
+            if (hasLatestUploadRows) {
+                latestUploadTotalWornHours
+            } else {
+                roundOne(rows.sumOf { it.wornHours })
+            }
+        val displayDateRange =
+            rows.map { it.hourStart.toLocalDate() }.distinct().let { dates ->
+                if (dates.isEmpty()) "--" else "${dates.minOrNull()} 至 ${dates.maxOrNull()}"
+            }
 
         addView(appHeader("数据验证", "蓝牙佩戴数据临时核对", showBell = false, showBack = true, backTarget = MainTab.Settings))
         addSpace(12)
@@ -3123,24 +3605,34 @@ class MainActivity : AppCompatActivity() {
                     cardHeader(
                         "本次获取",
                         latestUploadDeviceName ?: connectedBluetoothDevice?.name ?: selectedBluetoothDevice?.name ?: "未连接设备",
-                        chip(validationStatusChipText(), validationStatusChipColor()),
+                        chip(validationStatusChipText(displayStatus, rows), validationStatusChipColor(displayStatus, rows)),
                     ),
                 )
-                addView(infoStrip("这里展示的是本次实际上传到云端数据库的同一批数据，用于核对蓝牙设备佩戴数据是否正确。"))
+                addView(infoStrip("这里展示云端数据库已保存的逐小时佩戴数据；蓝牙读取并上传完成后，会立即用本次上传数据更新，便于核对时间是否正确。"))
                 addSpace(10)
-                addView(rowText("上传状态", latestUploadStatus))
+                addView(rowText("上传状态", displayStatus))
                 addSpace(6)
-                addView(rowText("数据起始时间", firstPoint?.let(::formatValidationHour) ?: "--"))
+                addView(rowText("云端日期范围", displayDateRange))
                 addSpace(6)
-                addView(rowText("开始佩戴时间", firstWearPoint?.let(::formatValidationHour) ?: "未发现佩戴点"))
+                addView(rowText("上次读取数据的时间", lastReadAt?.let(::formatValidationDateTime) ?: "--"))
                 addSpace(6)
-                addView(rowText("获取数据时间", receivedAt?.let(::formatValidationHour) ?: "--"))
+                addView(rowText("当前记录位置(head)", displayHistoryHead?.toString() ?: "--"))
                 addSpace(6)
-                addView(rowText("云端完成时间", completedAt?.let(::formatValidationHour) ?: "--"))
+                addView(rowText("本次读到的数据量", displayHistoryCount?.let { "${it}条（每条10分钟）" } ?: "--"))
                 addSpace(6)
-                addView(rowText("上传日期记录", "${latestUploadDailyCount}天"))
+                addView(rowText("本次读到的时间量", displayHistoryCount?.let(::formatReadDataDuration) ?: "--"))
                 addSpace(6)
-                addView(rowText("上传佩戴合计", "${formatHours(latestUploadTotalWornHours)}h"))
+                addView(rowText("数据起始时间", firstPoint?.let(::formatValidationDateTime) ?: "--"))
+                addSpace(6)
+                addView(rowText("开始佩戴时间", firstWearPoint?.let(::formatValidationDateTime) ?: "未发现佩戴点"))
+                addSpace(6)
+                addView(rowText("获取数据时间", receivedAt?.let(::formatValidationDateTime) ?: "--"))
+                addSpace(6)
+                addView(rowText("云端完成时间", completedAt?.let(::formatValidationDateTime) ?: "--"))
+                addSpace(6)
+                addView(rowText("上传日期记录", "${displayDailyCount}天"))
+                addSpace(6)
+                addView(rowText("上传佩戴合计", "${formatHours(displayTotalWornHours)}h"))
                 addSpace(12)
                 addView(
                     horizontal {
@@ -3163,13 +3655,13 @@ class MainActivity : AppCompatActivity() {
             card {
                 addView(
                     cardHeader(
-                        "逐小时佩戴时间",
-                        if (rows.isEmpty()) "暂无上传数据" else "${rows.size}小时 · 与云端上传包一致",
-                        chip("临时", P.primary),
+                        "逐小时佩戴次数",
+                        if (rows.isEmpty()) "暂无云端保存数据" else "${rows.size}小时 · 云端数据库已保存",
+                        chip(if (hasLatestUploadRows) "本次" else "云端", P.primary),
                     ),
                 )
                 if (rows.isEmpty()) {
-                    addView(infoStrip(if (connectedBluetoothDevice == null) "请先在设置页连接蓝牙设备，连接后会自动读取并上传。" else "点击“重新获取并上传”，读取设备数据并同时上传云端。"))
+                    addView(infoStrip(if (connectedBluetoothDevice == null) "请先在设置页连接蓝牙设备，连接后会自动读取并上传；或稍候等待云端数据读取完成。" else "点击“重新获取并上传”，读取设备数据并同时上传云端。"))
                 } else {
                     rows.forEachIndexed { index, item ->
                         if (index > 0) addSpace(6)
@@ -3185,7 +3677,7 @@ class MainActivity : AppCompatActivity() {
             addView(
                 cardHeader(
                     "蓝牙连接",
-                    "扫描并连接 DR-Z-T0 设备，读取电量和月度佩戴记录",
+                    "扫描并连接 WM-SP# 设备，读取电量和月度佩戴记录",
                     chip(if (connectedBluetoothDevice != null) "已连接" else "未连接", if (connectedBluetoothDevice != null) P.success else P.warning),
                 ),
             )
@@ -3205,7 +3697,7 @@ class MainActivity : AppCompatActivity() {
                         runWithBluetoothPermissions {
                             val device = selectedBluetoothDevice ?: bluetoothDevices.firstOrNull()
                             if (device == null) {
-                                bluetoothStatusMessage = "请先扫描并选择 DR-Z-T0 设备"
+                                bluetoothStatusMessage = "请先扫描并选择 WM-SP# 设备"
                                 refreshBluetoothUi()
                             } else {
                                 selectedBluetoothDevice = device
@@ -3226,6 +3718,7 @@ class MainActivity : AppCompatActivity() {
             addSpace(10)
             addView(secondaryButton("数据验证") {
                 currentTab = MainTab.BluetoothValidation
+                loadHomeWearData(force = true)
                 render()
             }, matchLp())
             addSpace(10)
@@ -3259,7 +3752,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             if (visibleDevices.isEmpty()) {
-                addView(infoStrip("未扫描到设备。请确认支具传感器开机且蓝牙名以 DR-Z-T0 开头。"))
+                addView(infoStrip("未扫描到设备。请确认支具传感器开机且蓝牙名以 WM-SP# 开头。"))
             } else {
                 visibleDevices.forEachIndexed { index, device ->
                     if (index > 0) addSpace(8)
@@ -3317,6 +3810,9 @@ class MainActivity : AppCompatActivity() {
         latestHistoryReceivedAt = null
         latestUploadValidationRows = emptyList()
         latestUploadFetchedAt = null
+        latestUploadLastReadAt = null
+        latestUploadHistoryHead = null
+        latestUploadHistoryCount = null
         latestUploadCompletedAt = null
         latestUploadDailyCount = 0
         latestUploadTotalWornHours = 0.0
@@ -3327,8 +3823,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun bluetoothValidationHours(snapshot: SpineBraceHistorySnapshot?): List<BluetoothValidationHour> {
-        val points = snapshot?.points.orEmpty()
+    private fun bluetoothValidationHours(snapshot: SpineBraceHistorySnapshot?): List<BluetoothValidationHour> =
+        bluetoothValidationHours(snapshot?.points.orEmpty())
+
+    private fun bluetoothValidationHours(points: List<SpineBraceWearPoint>): List<BluetoothValidationHour> {
         if (points.isEmpty()) {
             return emptyList()
         }
@@ -3340,10 +3838,17 @@ class MainActivity : AppCompatActivity() {
         val end = grouped.keys.maxOrNull() ?: return emptyList()
         val rows = mutableListOf<BluetoothValidationHour>()
         while (!cursor.isAfter(end)) {
-            val wornCount = grouped[cursor]?.count { it.worn } ?: 0
+            val samples =
+                grouped[cursor]
+                    .orEmpty()
+                    .sortedBy { it.recordedAt }
+            val wornCount = samples.count { it.worn }
             rows += BluetoothValidationHour(
                 hourStart = cursor,
                 wornHours = roundOne(wornCount / 6.0),
+                sampleCount = samples.size.coerceIn(0, 6),
+                wornCount = wornCount.coerceIn(0, 6),
+                samples = samples.map { BluetoothValidationSample(it.recordedAt, it.worn) },
             )
             cursor = cursor.plusHours(1)
         }
@@ -3356,60 +3861,143 @@ class MainActivity : AppCompatActivity() {
             background = rounded(P.surfaceAlt, dp(8), P.softLine)
             setPadding(dp(12), dp(9), dp(12), dp(9))
             addView(label(formatValidationHour(item.hourStart), 14f, P.text, Typeface.BOLD), weightLp(1f))
-            val color =
-                when {
-                    item.wornHours >= 0.95 -> P.success
-                    item.wornHours > 0.0 -> P.warning
-                    else -> P.danger
-                }
-            addView(chip("${formatHours(item.wornHours)}h", color))
+            addView(validationFractionChip(item))
         }
+
+    private fun formatValidationFraction(item: BluetoothValidationHour): String {
+        val sampleCount = item.sampleCount.coerceIn(0, 6)
+        val wornCount = item.wornCount.coerceIn(0, sampleCount)
+        val notWornCount = (sampleCount - wornCount).coerceAtLeast(0)
+        return "${wornCount}/${notWornCount}"
+    }
+
+    private fun validationFractionChip(item: BluetoothValidationHour): TextView {
+        val sampleCount = item.sampleCount.coerceIn(0, 6)
+        val wornCount = item.wornCount.coerceIn(0, sampleCount)
+        val notWornCount = (sampleCount - wornCount).coerceAtLeast(0)
+        val wornText = wornCount.toString()
+        val notWornText = notWornCount.toString()
+        val text = "$wornText/$notWornText"
+        val span = SpannableString(text).apply {
+            setSpan(ForegroundColorSpan(P.success), 0, wornText.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(ForegroundColorSpan(P.muted), wornText.length, wornText.length + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(ForegroundColorSpan(P.danger), wornText.length + 1, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        return TextView(this).apply {
+            this.text = span
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            minHeight = dp(28)
+            setPadding(dp(10), 0, dp(10), 0)
+            background = rounded(P.surface, dp(100), P.softLine)
+        }
+    }
 
     private fun formatValidationHour(value: LocalDateTime): String =
         value.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH':00'", Locale.US))
 
-    private fun validationStatusChipText(): String =
+    private fun formatValidationDateTime(value: LocalDateTime): String =
+        value.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.US))
+
+    private fun bluetoothValidationDisplayRows(): List<BluetoothValidationHour> {
+        if (shouldShowLatestUploadValidationRows()) {
+            return latestUploadValidationRows.sortedByDescending { it.hourStart }
+        }
+        val byHour = LinkedHashMap<LocalDateTime, BluetoothValidationHour>()
+        wearCloudRecords.flatMap { it.hourlyRows }.forEach { row ->
+            byHour[row.hourStart] = row
+        }
+        return byHour.values.sortedByDescending { it.hourStart }
+    }
+
+    private fun shouldShowLatestUploadValidationRows(): Boolean =
+        latestUploadValidationRows.isNotEmpty() &&
+            (deviceSyncInProgress || deviceSyncUploading) &&
+            !latestUploadStatus.contains("空历史") &&
+            !latestUploadStatus.contains("失败")
+
+    private fun validationStatusChipText(
+        status: String = latestUploadStatus,
+        rows: List<BluetoothValidationHour> = latestUploadValidationRows,
+    ): String =
         when {
-            latestUploadStatus.contains("完成") -> "完成"
-            latestUploadStatus.contains("失败") -> "失败"
-            latestUploadStatus.contains("空历史") -> "跳过"
-            latestUploadStatus.contains("上传") -> "上传中"
-            latestUploadStatus.contains("读取") -> "读取中"
+            status.contains("完成") -> "完成"
+            status.contains("失败") -> "失败"
+            status.contains("空历史") -> "跳过"
+            status.contains("云端") && rows.isNotEmpty() -> "云端"
+            status.contains("上传") -> "上传中"
+            status.contains("读取") -> "读取中"
             else -> "等待"
         }
 
-    private fun validationStatusChipColor(): Int =
-        when (validationStatusChipText()) {
+    private fun validationStatusChipColor(
+        status: String = latestUploadStatus,
+        rows: List<BluetoothValidationHour> = latestUploadValidationRows,
+    ): Int =
+        when (validationStatusChipText(status, rows)) {
             "完成" -> P.success
             "失败", "跳过" -> P.danger
+            "云端" -> P.primary
             "上传中", "读取中" -> P.warning
             else -> P.primary
         }
 
     private fun LinearLayout.addAlertsPage() {
-        addView(appHeader("消息中心", "全部 / 未读", showBell = false, showBack = true))
-        addView(alertRow("红", "6月5日至9日连续严重不足", "连续5天低于医嘱60%，建议查看缺口并联系医生或支具师。", P.danger))
-        addSpace(8)
-        addView(alertRow("黄", "左腰部连续2天发红", "请观察摩擦点，持续不适时及时咨询支具师。", P.warning))
-        addSpace(8)
-        addView(alertRow("绿", "复诊提醒", "距上次影像检查已6个月，可预约复查。", P.success))
+        loadAlerts()
+        addView(appHeader("消息中心", alertCenterSummaryText(), showBell = false, showBack = true, backTarget = alertsBackTarget))
         addSpace(12)
         addView(
             card {
-                addView(cardHeader("预警详情", "红色预警", chip("红色", P.danger)))
-                addInsight("触发原因：6月5日至6月9日连续5天佩戴低于医嘱60%。")
-                addInsight("相关数据：5天平均10.4h/天，目标20h/天。")
-                addInsight("建议操作：查看缺口分析；如持续困难，联系主治医生或支具师。")
-                addSpace(12)
-                addView(primaryButton("我已处理") {
-                    currentTab = MainTab.Home
-                    render()
-                }, matchLp())
+                addView(
+                    cardHeader(
+                        "消息列表",
+                        when {
+                            alertsLoading -> "正在读取云端消息"
+                            alertItems.isEmpty() && alertsLoadedChildId == child.id -> "暂无待查看消息"
+                            else -> "按预警等级和时间排序"
+                        },
+                        chip("${unreadAlertCount()}待处理", if (unreadAlertCount() > 0) P.danger else P.success),
+                    ),
+                )
+                when {
+                    alertsLoading -> addView(infoStrip("正在读取云端消息，请稍候。"))
+                    alertsStatusMessage != null -> addView(infoStrip(alertsStatusMessage ?: "消息读取失败，请稍后重试。"))
+                    alertItems.isEmpty() -> addView(infoStrip("暂无消息。出现佩戴不足、皮肤问题、复诊提醒等情况后，会在这里显示。"))
+                    else ->
+                        alertItems.forEachIndexed { index, item ->
+                            if (index > 0) addSpace(8)
+                            addView(alertRow(item))
+                        }
+                }
             },
         )
     }
 
     private fun renderChildMode(): View {
+        loadHomeWearData()
+        val records = wearCloudRecords.sortedBy { it.date }
+        val today = LocalDate.now()
+        val todayRecord = records.lastOrNull { it.date == today }
+        val recent7 = records.takeLast(7)
+        val weekSummary = summaryFromWearRecords(recent7)
+        val currentStreak = currentWearStreak(records)
+        val todayHours = todayRecord?.wornHours ?: 0.0
+        val todayProgress = if (todayRecord != null) wearProgressPercent(todayHours, prescribedWearHours()) else 0
+        val progressText =
+            when {
+                todayRecord != null -> "今日进度 ${todayProgress}%"
+                wearCloudLoading -> "正在读取"
+                else -> "今日暂无记录"
+            }
+        val progressColor =
+            when {
+                todayRecord != null && isWearCompliant(todayRecord) -> P.success
+                todayRecord != null && todayProgress >= 80 -> P.primary
+                todayRecord != null -> P.warning
+                else -> P.muted
+            }
+        val badges = childModeBadges(todayRecord, recent7, currentStreak)
         return screenPage(showBottomPadding = false) {
             addView(
                 horizontal {
@@ -3430,21 +4018,33 @@ class MainActivity : AppCompatActivity() {
                 vertical {
                     background = rounded(0xFF365F71.toInt(), dp(24), null)
                     setPadding(dp(22), dp(22), dp(22), dp(22))
-                    addView(chip("今日进度 100%", P.success))
+                    addView(chip(progressText, progressColor))
                     addSpace(12)
-                    addView(label("朵朵，今天已经恢复达标了", 25f, Color.WHITE, Typeface.BOLD))
-                    addView(label("连续3天达标，睡前再做一次皮肤检查。", 15f, 0xFFEAF7F7.toInt()))
+                    addView(label(childModeHeroTitle(todayRecord, todayProgress), 25f, Color.WHITE, Typeface.BOLD))
+                    addView(label(childModeHeroSubtitle(todayRecord, recent7, currentStreak), 15f, 0xFFEAF7F7.toInt()))
                 },
             )
             addSpace(12)
-            addView(metricGrid(listOf("3" to "连续达标", "16.8h" to "本周日均", "43%" to "本周达标")))
+            addView(
+                metricGrid(
+                    listOf(
+                        dayCount(currentStreak) to "连续达标",
+                        "${formatHours(weekSummary.avgHours)}h" to "近7天日均",
+                        "${weekSummary.complianceRate}%" to "近7天达标",
+                    ),
+                ),
+            )
             addSpace(12)
             addView(
                 card {
-                    addView(cardHeader("阶段徽章", "本月", null))
+                    addView(cardHeader("阶段徽章", if (records.isEmpty()) "同步数据后点亮" else "根据云端佩戴自动点亮", null))
                     addView(
                         grid(3) {
-                            listOf("恢复达标", "3天连击", "复诊准备").forEach { addQuick(it) {} }
+                            badges.forEach { badge ->
+                                addQuick(badge) {
+                                    Toast.makeText(this@MainActivity, uiText("已点亮$badge"), Toast.LENGTH_SHORT).show()
+                                }
+                            }
                         },
                     )
                 },
@@ -3454,10 +4054,71 @@ class MainActivity : AppCompatActivity() {
                 card {
                     addView(label("今晚的小目标", 17f, P.text, Typeface.BOLD))
                     addSpace(8)
-                    addView(label("洗漱前穿戴，睡前检查腰部皮肤。完成后自动更新今天的进度。", 15f, P.secondary))
+                    addView(label(childModeGoalText(todayRecord, recent7), 15f, P.secondary))
                 },
             )
         }
+    }
+
+    private fun childModeHeroTitle(todayRecord: WearRecord?, todayProgress: Int): String {
+        val name = child.nickname.ifBlank { "孩子" }
+        return when {
+            todayRecord == null && wearCloudLoading -> "${name}，正在读取今天的进度"
+            todayRecord == null -> "${name}，今天还没有同步数据"
+            isWearCompliant(todayRecord) -> "${name}，今天已经达标了"
+            else -> "${name}，今天已完成${todayProgress}%"
+        }
+    }
+
+    private fun childModeHeroSubtitle(todayRecord: WearRecord?, recent7: List<WearRecord>, currentStreak: Int): String =
+        when {
+            todayRecord == null && wearCloudLoading -> "连接云端后，会自动显示今天的佩戴进度和徽章。"
+            todayRecord == null -> "先连接蓝牙同步今天的数据，让进度条亮起来。"
+            isWearCompliant(todayRecord) -> "连续${currentStreak}天达标，睡前保持佩戴并做一次皮肤自查。"
+            else -> {
+                val gap = (prescribedWearHours() - todayRecord.wornHours).coerceAtLeast(0.0)
+                val gapHint = topGapHours(recent7).firstOrNull()
+                if (gapHint != null) {
+                    "今天还差约${formatHours(gap)}h，优先守住$gapHint 这个容易缺口的时段。"
+                } else {
+                    "今天还差约${formatHours(gap)}h，把剩余目标拆成饭后和睡前两段完成。"
+                }
+            }
+        }
+
+    private fun childModeGoalText(todayRecord: WearRecord?, recent7: List<WearRecord>): String =
+        when {
+            todayRecord == null && wearCloudLoading -> "正在读取云端佩戴数据，读取完成后自动生成今晚目标。"
+            todayRecord == null -> "先完成一次蓝牙读取并上传，今晚目标会根据真实数据自动生成。"
+            isWearCompliant(todayRecord) -> "保持当前佩戴节奏，睡前检查腰部、背部和肩部皮肤。"
+            else -> {
+                val gap = (prescribedWearHours() - todayRecord.wornHours).coerceAtLeast(0.0)
+                val gapHint = topGapHours(recent7).firstOrNull()
+                if (gapHint != null) {
+                    "今晚先补足${formatHours(gap)}h中的一部分，重点关注$gapHint。"
+                } else {
+                    "今晚先补足${formatHours(gap)}h中的一部分，完成后再同步一次数据。"
+                }
+            }
+        }
+
+    private fun childModeBadges(todayRecord: WearRecord?, recent7: List<WearRecord>, currentStreak: Int): List<String> =
+        listOf(
+            if (todayRecord != null && isWearCompliant(todayRecord)) "今日达标" else "今日冲刺",
+            if (currentStreak >= 2) "${currentStreak}天连击" else "稳定起步",
+            if (recent7.isNotEmpty() && summaryFromWearRecords(recent7).complianceRate >= 80) "本周很稳" else "继续升级",
+        )
+
+    private fun currentWearStreak(records: List<WearRecord>): Int {
+        var streak = 0
+        for (record in records.sortedByDescending { it.date }) {
+            if (isWearCompliant(record)) {
+                streak += 1
+            } else {
+                break
+            }
+        }
+        return streak
     }
 
     private fun bottomNavigation(): View {
@@ -3581,10 +4242,17 @@ class MainActivity : AppCompatActivity() {
     private fun scheduleBluetoothAutoDisconnect() {
         cancelBluetoothAutoDisconnect()
         val disconnectRunnable =
-            Runnable {
+            object : Runnable {
+                override fun run() {
                 if (connectedBluetoothDevice != null) {
+                    if (deviceSyncInProgress || deviceSyncUploading) {
+                        autoDisconnectRunnable = this
+                        mainHandler.postDelayed(this, BLUETOOTH_AUTO_DISCONNECT_DEFER_MS)
+                        return
+                    }
                     pendingAutoDisconnectNotice = true
                     spineBraceBluetooth.disconnect()
+                }
                 }
             }
         autoDisconnectRunnable = disconnectRunnable
@@ -3638,27 +4306,231 @@ class MainActivity : AppCompatActivity() {
     private fun SpineBraceDevice.matchesBluetoothDevice(other: SpineBraceDevice): Boolean =
         address.equals(other.address, ignoreCase = true) || name.equals(other.name, ignoreCase = true)
 
-    private fun startAutoDeviceDataSync() {
+    private fun markDeviceSyncPhase(phase: String, status: String? = null) {
+        prefs.edit()
+            .putString(KEY_DEVICE_SYNC_PHASE, phase)
+            .putString(KEY_DEVICE_SYNC_UPDATED_AT, LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+            .putString(KEY_DEVICE_SYNC_DEVICE_NAME, latestUploadDeviceName ?: connectedBluetoothDevice?.name ?: selectedBluetoothDevice?.name.orEmpty())
+            .putString(KEY_DEVICE_SYNC_STATUS, status ?: latestUploadStatus)
+            .apply()
+    }
+
+    private fun markDeviceSyncInterrupted(status: String) {
+        markDeviceSyncPhase(DEVICE_SYNC_PHASE_INTERRUPTED, status)
+        latestUploadStatus = status
+        bluetoothStatusMessage = status
+        setHomeBluetoothWarning(DEVICE_SYNC_INTERRUPTED_WARNING_MESSAGE)
+    }
+
+    private fun clearDeviceSyncPhase() {
+        prefs.edit()
+            .remove(KEY_DEVICE_SYNC_PHASE)
+            .remove(KEY_DEVICE_SYNC_UPDATED_AT)
+            .remove(KEY_DEVICE_SYNC_DEVICE_NAME)
+            .remove(KEY_DEVICE_SYNC_STATUS)
+            .apply()
+        if (bluetoothHomeWarningMessage == DEVICE_SYNC_INTERRUPTED_WARNING_MESSAGE) {
+            setHomeBluetoothWarning(null)
+        }
+    }
+
+    private fun recoverPendingDeviceSyncState() {
+        val phase = prefs.getString(KEY_DEVICE_SYNC_PHASE, null)?.takeIf { it.isNotBlank() } ?: return
+        val deviceName = prefs.getString(KEY_DEVICE_SYNC_DEVICE_NAME, null).orEmpty()
+        val phaseText =
+            when (phase) {
+                DEVICE_SYNC_PHASE_READING -> "读取设备数据"
+                DEVICE_SYNC_PHASE_LOCAL_SAVING -> "写入手机本地"
+                DEVICE_SYNC_PHASE_LOCAL_VERIFYING -> "核对手机本地数据"
+                DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD -> "等待本地上传云端"
+                DEVICE_SYNC_PHASE_CLOUD_UPLOADING -> "从手机本地上传云端"
+                DEVICE_SYNC_PHASE_VERIFYING -> "核对云端数据"
+                DEVICE_SYNC_PHASE_CLEARING -> "清理设备历史"
+                else -> "同步"
+            }
+        bluetoothStatusMessage =
+            if (deviceName.isBlank()) {
+                "上次数据获取在${phaseText}阶段未安全完成；设备历史数据已保留，请靠近设备重新连接。"
+            } else {
+                "上次 ${deviceName} 数据获取在${phaseText}阶段未安全完成；设备历史数据已保留，请靠近设备重新连接。"
+            }
+        latestUploadStatus = bluetoothStatusMessage
+        setHomeBluetoothWarning(DEVICE_SYNC_INTERRUPTED_WARNING_MESSAGE)
+    }
+
+    private fun startAutoDeviceDataSync(resetRetryCounters: Boolean = true) {
         pendingHistoryUploadRunnable?.let(mainHandler::removeCallbacks)
         pendingHistoryUploadRunnable = null
+        cancelHistoryReadTimeout()
+        if (resetRetryCounters) {
+            deviceHistoryReadRetries = 0
+            deviceSyncReconnectRetries = 0
+            resumingDeviceSyncAfterDisconnect = false
+        } else {
+            deviceHistoryReadRetries = 0
+        }
         deviceSyncInProgress = true
         deviceSyncUploading = false
         deviceSyncCompleted = false
+        latestHistorySnapshot = null
+        latestHistoryReceivedAt = null
         latestUploadStatus = "正在读取设备数据，准备上传云端"
         latestUploadDeviceName = connectedBluetoothDevice?.name ?: selectedBluetoothDevice?.name
         bluetoothStatusMessage = deviceReadingMessage
+        markDeviceSyncPhase(DEVICE_SYNC_PHASE_READING, latestUploadStatus)
         Toast.makeText(this, deviceReadingMessage, Toast.LENGTH_SHORT).show()
         refreshBluetoothUi()
-        spineBraceBluetooth.requestHistory(reportStatus = false)
+        requestDeviceHistoryForSync()
+    }
+
+    private fun requestDeviceHistoryForSync() {
+        val sent = spineBraceBluetooth.requestHistory(reportStatus = false)
+        if (!sent) {
+            deviceSyncInProgress = false
+            deviceSyncUploading = false
+            deviceSyncCompleted = false
+            latestUploadStatus = "设备数据读取指令发送失败，请保持蓝牙连接后重试"
+            bluetoothStatusMessage = latestUploadStatus
+            markDeviceSyncInterrupted(latestUploadStatus)
+            Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+            refreshBluetoothUi()
+            return
+        }
+        scheduleHistoryReadTimeout()
+    }
+
+    private fun scheduleHistoryReadTimeout() {
+        cancelHistoryReadTimeout()
+        val snapshot = latestHistorySnapshot
+        val timeoutMs =
+            if (snapshot == null || snapshot.packetCount == 0) {
+                DEVICE_HISTORY_INITIAL_TIMEOUT_MS
+            } else {
+                DEVICE_HISTORY_PACKET_IDLE_TIMEOUT_MS
+            }
+        val timeoutRunnable =
+            Runnable {
+                historyReadTimeoutRunnable = null
+                if (!deviceSyncInProgress || deviceSyncUploading || deviceSyncCompleted) {
+                    return@Runnable
+                }
+                latestHistorySnapshot?.takeIf { it.complete }?.let { snapshot ->
+                    scheduleDeviceHistoryUpload(snapshot)
+                    return@Runnable
+                }
+                val currentSnapshot = latestHistorySnapshot
+                if (connectedBluetoothDevice != null && currentSnapshot?.header == null && deviceHistoryReadRetries < MAX_DEVICE_HISTORY_READ_RETRIES) {
+                    deviceHistoryReadRetries += 1
+                    latestHistorySnapshot = null
+                    latestHistoryReceivedAt = null
+                    bluetoothStatusMessage = "设备数据读取未完成，正在重新请求"
+                    latestUploadStatus = bluetoothStatusMessage
+                    markDeviceSyncPhase(DEVICE_SYNC_PHASE_READING, latestUploadStatus)
+                    refreshBluetoothUi()
+                    requestDeviceHistoryForSync()
+                    return@Runnable
+                }
+                deviceSyncInProgress = false
+                deviceSyncUploading = false
+                deviceSyncCompleted = false
+                resumingDeviceSyncAfterDisconnect = false
+                latestUploadStatus =
+                    if (currentSnapshot?.header != null && currentSnapshot.packetCount <= 1) {
+                        "已收到设备头包，但未收到佩戴数据包；已停止自动重试，请保持设备靠近后重新获取。"
+                    } else {
+                        "设备数据读取超时，未完成上传；已停止自动重试，请保持设备靠近后重新获取。"
+                    }
+                bluetoothStatusMessage = latestUploadStatus
+                markDeviceSyncInterrupted(latestUploadStatus)
+                Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+                refreshBluetoothUi()
+            }
+        historyReadTimeoutRunnable = timeoutRunnable
+        mainHandler.postDelayed(timeoutRunnable, timeoutMs)
+    }
+
+    private fun cancelHistoryReadTimeout() {
+        historyReadTimeoutRunnable?.let(mainHandler::removeCallbacks)
+        historyReadTimeoutRunnable = null
+    }
+
+    private fun handleDeviceSyncDisconnected(): Boolean {
+        if ((!deviceSyncInProgress && !deviceSyncUploading) || deviceSyncCompleted || pendingAutoDisconnectNotice) {
+            return false
+        }
+        val phase = prefs.getString(KEY_DEVICE_SYNC_PHASE, null)
+        if (deviceSyncUploading &&
+            pendingDeviceWearFile().exists() &&
+            phase in setOf(DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, DEVICE_SYNC_PHASE_CLOUD_UPLOADING)
+        ) {
+            connectedBluetoothDevice = null
+            latestBraceTelemetry = null
+            cancelAutoConnectTimeout()
+            cancelBluetoothAutoDisconnect()
+            bluetoothStatusMessage = "蓝牙已断开，正在继续从手机本地上传云端"
+            latestUploadStatus = bluetoothStatusMessage
+            refreshBluetoothUi()
+            return true
+        }
+        pendingHistoryUploadRunnable?.let(mainHandler::removeCallbacks)
+        pendingHistoryUploadRunnable = null
+        cancelHistoryReadTimeout()
+        connectedBluetoothDevice = null
+        latestBraceTelemetry = null
+        deviceSyncUploading = false
+        deviceSyncInProgress = false
+        deviceSyncCompleted = false
+        resumingDeviceSyncAfterDisconnect = false
+        cancelAutoConnectTimeout()
+        cancelBluetoothAutoDisconnect()
+        bluetoothStatusMessage = "蓝牙读取中断，已停止自动重试，请重新连接后获取。"
+        latestUploadStatus = "蓝牙读取中断，未完成上传。"
+        markDeviceSyncInterrupted(latestUploadStatus)
+        Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+        refreshBluetoothUi()
+        return true
+    }
+
+    private fun retryDeviceSyncConnection(message: String) {
+        val retryTarget = selectedBluetoothDevice ?: loadLastBluetoothDevice()
+        if (retryTarget == null || deviceSyncReconnectRetries >= MAX_DEVICE_SYNC_RECONNECT_RETRIES) {
+            deviceSyncInProgress = false
+            deviceSyncUploading = false
+            deviceSyncCompleted = false
+            resumingDeviceSyncAfterDisconnect = false
+            bluetoothStatusMessage = "蓝牙读取中断，请重新扫描连接设备后再读取。"
+            latestUploadStatus = "蓝牙读取中断，未完成上传"
+            Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+            refreshBluetoothUi()
+            return
+        }
+        deviceSyncReconnectRetries += 1
+        resumingDeviceSyncAfterDisconnect = true
+        selectedBluetoothDevice = retryTarget
+        bluetoothStatusMessage = "$message（第${deviceSyncReconnectRetries}次）"
+        latestUploadStatus = bluetoothStatusMessage
+        refreshBluetoothUi()
+        mainHandler.postDelayed(
+            {
+                if (deviceSyncInProgress && !deviceSyncCompleted) {
+                    runWithBluetoothPermissions {
+                        spineBraceBluetooth.connect(retryTarget)
+                    }
+                }
+            },
+            DEVICE_SYNC_RECONNECT_DELAY_MS,
+        )
     }
 
     private fun scheduleDeviceHistoryUpload(snapshot: SpineBraceHistorySnapshot) {
         if (deviceSyncUploading || deviceSyncCompleted) {
             return
         }
-        if (snapshot.points.isEmpty() && !snapshot.complete) {
+        if (!snapshot.complete) {
+            scheduleHistoryReadTimeout()
             return
         }
+        cancelHistoryReadTimeout()
         pendingHistoryUploadRunnable?.let(mainHandler::removeCallbacks)
         val runnable =
             Runnable {
@@ -3676,50 +4548,442 @@ class MainActivity : AppCompatActivity() {
         }
         val device = connectedBluetoothDevice
         val uploadPackage = buildDeviceWearUploadPayload(snapshot, device)
+        if (uploadPackage.dailyCount == 0) {
+            updateBluetoothUploadValidation(uploadPackage, "空历史，未上传云端", completed = true)
+            deviceSyncInProgress = false
+            deviceSyncUploading = false
+            deviceSyncCompleted = true
+            bluetoothStatusMessage = deviceReadCompleteMessage
+            clearDeviceSyncPhase()
+            loadHomeWearData(force = true)
+            Toast.makeText(this, deviceReadCompleteMessage, Toast.LENGTH_SHORT).show()
+            refreshBluetoothUi()
+            return
+        }
         if (snapshotLooksLikeClearedDeviceHistory(snapshot)) {
             updateBluetoothUploadValidation(uploadPackage, "空历史，未上传云端", completed = true)
             deviceSyncInProgress = false
             deviceSyncUploading = false
             deviceSyncCompleted = true
             bluetoothStatusMessage = deviceReadCompleteMessage
+            clearDeviceSyncPhase()
             loadHomeWearData(force = true)
             Toast.makeText(this, deviceReadCompleteMessage, Toast.LENGTH_SHORT).show()
             refreshBluetoothUi()
             return
         }
+        val localVerification =
+            runCatching {
+                markDeviceSyncPhase(DEVICE_SYNC_PHASE_LOCAL_SAVING, "正在写入手机本地存储")
+                saveDeviceWearPackageToLocal(uploadPackage)
+                markDeviceSyncPhase(DEVICE_SYNC_PHASE_LOCAL_VERIFYING, "正在核对手机本地数据")
+                verifyLocalDeviceWearPackage(uploadPackage)
+            }.getOrElse { error ->
+                deviceSyncInProgress = false
+                deviceSyncUploading = false
+                deviceSyncCompleted = false
+                bluetoothStatusMessage = "手机本地保存失败，未清理设备历史；请重新获取"
+                updateBluetoothUploadValidation(uploadPackage, "手机本地保存失败：${error.message.orEmpty()}", completed = true)
+                markDeviceSyncInterrupted(bluetoothStatusMessage)
+                Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+                refreshBluetoothUi()
+                return
+            }
+        if (!localVerification.verified) {
+            deviceSyncInProgress = false
+            deviceSyncUploading = false
+            deviceSyncCompleted = false
+            bluetoothStatusMessage = "手机本地核对失败，未清理设备历史；请重新获取"
+            updateBluetoothUploadValidation(
+                uploadPackage,
+                "本地核对失败：匹配${localVerification.matchedCount}/${localVerification.expectedCount}，缺失${localVerification.missingCount}，不一致${localVerification.mismatchedCount}",
+                completed = true,
+            )
+            markDeviceSyncInterrupted(bluetoothStatusMessage)
+            Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+            refreshBluetoothUi()
+            return
+        }
+        updateBluetoothUploadValidation(uploadPackage, "手机本地核对完成，正在清理设备历史", completed = false)
+        markDeviceSyncPhase(DEVICE_SYNC_PHASE_CLEARING, "手机本地已核对，正在清理设备历史")
+        refreshBluetoothUi()
+        val cleared = spineBraceBluetooth.clearMonthlyDataWithCurrentTime(reportStatus = false)
+        if (!cleared) {
+            deviceSyncInProgress = false
+            deviceSyncUploading = false
+            deviceSyncCompleted = false
+            bluetoothStatusMessage = "设备历史清理失败；手机本地数据已保存，请保持蓝牙连接后重新获取"
+            updateBluetoothUploadValidation(uploadPackage, "设备清理失败，手机本地数据已保留", completed = true)
+            markDeviceSyncInterrupted(bluetoothStatusMessage)
+            Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+            refreshBluetoothUi()
+            return
+        }
+        markDeviceSyncPhase(DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, "设备历史已清理，等待从手机本地上传云端")
+        pendingAutoDisconnectNotice = true
+        spineBraceBluetooth.disconnect()
+        uploadLocalDeviceWearPackage(uploadPackage)
+    }
+
+    private fun pendingDeviceWearFile(): File =
+        File(filesDir, LOCAL_DEVICE_WEAR_FILE_NAME)
+
+    private fun deviceWearSessionTempFile(): File =
+        File(filesDir, LOCAL_DEVICE_WEAR_SESSION_TEMP_FILE_NAME)
+
+    private fun localDeviceWearArchiveFile(): File =
+        File(filesDir, LOCAL_DEVICE_WEAR_ARCHIVE_FILE_NAME)
+
+    private fun saveDeviceHistorySessionTemp(snapshot: SpineBraceHistorySnapshot) {
+        val header = snapshot.header
+        val points = JSONArray()
+        snapshot.points.forEach { point ->
+            points.put(
+                JSONObject()
+                    .put("recorded_at", point.recordedAt.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+                    .put("worn", point.worn),
+            )
+        }
+        val rawPackets = JSONArray()
+        snapshot.rawPacketsHex.forEach(rawPackets::put)
+        val sequences = JSONArray()
+        snapshot.payloadSequences.forEach(sequences::put)
+        val envelope =
+            JSONObject()
+                .put("version", 1)
+                .put("updated_at", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+                .put("device_name", connectedBluetoothDevice?.name ?: selectedBluetoothDevice?.name ?: JSONObject.NULL)
+                .put("device_address", connectedBluetoothDevice?.address ?: selectedBluetoothDevice?.address ?: JSONObject.NULL)
+                .put("complete", snapshot.complete)
+                .put("packet_count", snapshot.packetCount)
+                .put("total_bits", snapshot.totalBits)
+                .put("worn_bits", snapshot.wornBits)
+                .put("payload_sequences", sequences)
+                .put("raw_packets_hex", rawPackets)
+                .put("points", points)
+                .put(
+                    "header",
+                    JSONObject()
+                        .put("head", header?.head ?: JSONObject.NULL)
+                        .put("count", header?.count ?: JSONObject.NULL)
+                        .put("last_read_at", header?.lastReadAt?.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME) ?: header?.lastReadAtText ?: JSONObject.NULL)
+                        .put("device_time", header?.deviceTimeText ?: JSONObject.NULL)
+                        .put("next_save_seconds", header?.nextSaveSeconds ?: JSONObject.NULL),
+                )
+        val finalFile = deviceWearSessionTempFile()
+        val tempFile = File(filesDir, "$LOCAL_DEVICE_WEAR_SESSION_TEMP_FILE_NAME.tmp")
+        runCatching {
+            tempFile.writeText(envelope.toString(), Charsets.UTF_8)
+            if (finalFile.exists()) {
+                finalFile.delete()
+            }
+            if (!tempFile.renameTo(finalFile)) {
+                finalFile.writeText(envelope.toString(), Charsets.UTF_8)
+                tempFile.delete()
+            }
+        }
+    }
+
+    private fun deleteDeviceHistorySessionTemp() {
+        deviceWearSessionTempFile().takeIf { it.exists() }?.delete()
+    }
+
+    private fun saveDeviceWearPackageToLocal(uploadPackage: DeviceWearUploadPackage) {
+        val envelope = buildDeviceWearLocalEnvelope(uploadPackage)
+        val finalFile = pendingDeviceWearFile()
+        val tempFile = File(filesDir, "$LOCAL_DEVICE_WEAR_FILE_NAME.tmp")
+        tempFile.writeText(envelope.toString(), Charsets.UTF_8)
+        if (finalFile.exists() && !finalFile.delete()) {
+            throw IllegalStateException("无法替换旧的本地数据")
+        }
+        if (!tempFile.renameTo(finalFile)) {
+            finalFile.writeText(envelope.toString(), Charsets.UTF_8)
+            tempFile.delete()
+        }
+        appendDeviceWearPackageToArchive(envelope)
+        deleteDeviceHistorySessionTemp()
+    }
+
+    private fun buildDeviceWearLocalEnvelope(uploadPackage: DeviceWearUploadPackage): JSONObject =
+        JSONObject()
+            .put("version", 1)
+            .put("sync_id", localDeviceWearSyncId(uploadPackage))
+            .put("saved_at", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+            .put("child_id", uploadPackage.childId)
+            .put("device_name", uploadPackage.deviceName ?: JSONObject.NULL)
+            .put("sample_count", uploadPackage.expectedWearPoints.size)
+            .put("worn_count", uploadPackage.expectedWearPoints.count { it.worn })
+            .put("cloud_upload_status", "pending")
+            .put("cloud_verified", false)
+            .put("source", "bluetooth_device")
+            .put("raw_bluetooth_session", localSessionJsonOrNull() ?: JSONObject.NULL)
+            .put("payload", uploadPackage.payload)
+
+    private fun localSessionJsonOrNull(): JSONObject? {
+        val file = deviceWearSessionTempFile()
+        return if (file.exists()) {
+            runCatching { JSONObject(file.readText(Charsets.UTF_8)) }.getOrNull()
+        } else {
+            null
+        }
+    }
+
+    private fun localDeviceWearSyncId(uploadPackage: DeviceWearUploadPackage): String {
+        val points = uploadPackage.expectedWearPoints.sortedBy { it.recordedAt }
+        val first = points.firstOrNull()?.recordedAt?.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME).orEmpty()
+        val last = points.lastOrNull()?.recordedAt?.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME).orEmpty()
+        val wornCount = points.count { it.worn }
+        return listOf(
+            uploadPackage.childId,
+            uploadPackage.deviceName.orEmpty(),
+            first,
+            last,
+            points.size.toString(),
+            wornCount.toString(),
+            uploadPackage.historyHead?.toString().orEmpty(),
+            uploadPackage.historyCount?.toString().orEmpty(),
+        ).joinToString("|")
+    }
+
+    private fun appendDeviceWearPackageToArchive(envelope: JSONObject) {
+        val archiveFile = localDeviceWearArchiveFile()
+        val archive =
+            if (archiveFile.exists()) {
+                runCatching { JSONObject(archiveFile.readText(Charsets.UTF_8)) }.getOrElse { JSONObject() }
+            } else {
+                JSONObject()
+            }
+        val items = archive.optJSONArray("items") ?: JSONArray()
+        val syncId = envelope.optString("sync_id", "")
+        var replaced = false
+        val mergedItems = JSONArray()
+        for (index in 0 until items.length()) {
+            val item = items.optJSONObject(index) ?: continue
+            if (syncId.isNotBlank() && item.optString("sync_id", "") == syncId) {
+                mergedItems.put(envelope)
+                replaced = true
+            } else {
+                mergedItems.put(item)
+            }
+        }
+        if (!replaced) {
+            mergedItems.put(envelope)
+        }
+        val updatedArchive =
+            JSONObject()
+                .put("version", 1)
+                .put("updated_at", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+                .put("items", mergedItems)
+        val tempFile = File(filesDir, "$LOCAL_DEVICE_WEAR_ARCHIVE_FILE_NAME.tmp")
+        tempFile.writeText(updatedArchive.toString(), Charsets.UTF_8)
+        if (archiveFile.exists() && !archiveFile.delete()) {
+            throw IllegalStateException("无法更新手机本地长期佩戴归档")
+        }
+        if (!tempFile.renameTo(archiveFile)) {
+            archiveFile.writeText(updatedArchive.toString(), Charsets.UTF_8)
+            tempFile.delete()
+        }
+    }
+
+    private fun updateDeviceWearArchiveUploadStatus(
+        uploadPackage: DeviceWearUploadPackage,
+        status: String,
+        cloudVerified: Boolean,
+        note: String? = null,
+    ) {
+        val archiveFile = localDeviceWearArchiveFile()
+        if (!archiveFile.exists()) {
+            return
+        }
+        val archive = runCatching { JSONObject(archiveFile.readText(Charsets.UTF_8)) }.getOrNull() ?: return
+        val items = archive.optJSONArray("items") ?: return
+        val syncId = localDeviceWearSyncId(uploadPackage)
+        var changed = false
+        val updatedItems = JSONArray()
+        for (index in 0 until items.length()) {
+            val item = items.optJSONObject(index) ?: continue
+            if (item.optString("sync_id", "") == syncId) {
+                item.put("cloud_upload_status", status)
+                item.put("cloud_verified", cloudVerified)
+                item.put("cloud_status_updated_at", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+                note?.let { item.put("cloud_status_note", it) }
+                changed = true
+            }
+            updatedItems.put(item)
+        }
+        if (!changed) {
+            return
+        }
+        val updatedArchive =
+            JSONObject()
+                .put("version", archive.optInt("version", 1))
+                .put("updated_at", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+                .put("items", updatedItems)
+        val tempFile = File(filesDir, "$LOCAL_DEVICE_WEAR_ARCHIVE_FILE_NAME.tmp")
+        tempFile.writeText(updatedArchive.toString(), Charsets.UTF_8)
+        if (archiveFile.exists()) {
+            archiveFile.delete()
+        }
+        if (!tempFile.renameTo(archiveFile)) {
+            archiveFile.writeText(updatedArchive.toString(), Charsets.UTF_8)
+            tempFile.delete()
+        }
+    }
+
+    private fun loadLocalDeviceWearPackage(): DeviceWearUploadPackage? {
+        val file = pendingDeviceWearFile()
+        if (!file.exists()) {
+            return null
+        }
+        val envelope =
+            runCatching {
+                JSONObject(file.readText(Charsets.UTF_8))
+            }.getOrNull() ?: return null
+        val payload = envelope.optJSONObject("payload") ?: return null
+        val rows = payloadHourlyRows(payload)
+        val points = localWearPointsFromPayload(payload)
+        val raw = payload.optJSONObject("raw")
+        val records = payload.optJSONArray("records") ?: JSONArray()
+        val deviceName =
+            payload.optString("device_name", "")
+                .takeIf { it.isNotBlank() && it != "null" }
+        return DeviceWearUploadPackage(
+            childId = payload.optString("child_id", child.id).ifBlank { child.id },
+            payload = payload,
+            hourlyRows = rows,
+            expectedWearPoints = points,
+            fetchedAt = parseCloudDateTime(envelope.optString("saved_at", "")) ?: LocalDateTime.now(),
+            lastReadAt = parseWearRawLastReadAt(JSONObject().put("raw", raw ?: JSONObject())),
+            historyHead = parseWearRawInt(JSONObject().put("raw", raw ?: JSONObject()), "history_head"),
+            historyCount = parseWearRawInt(JSONObject().put("raw", raw ?: JSONObject()), "history_count"),
+            dailyCount = records.length(),
+            totalWornHours = roundOne(rows.sumOf { it.wornHours }),
+            deviceName = deviceName,
+        )
+    }
+
+    private fun deleteLocalDeviceWearPackage() {
+        pendingDeviceWearFile().takeIf { it.exists() }?.delete()
+    }
+
+    private fun verifyLocalDeviceWearPackage(uploadPackage: DeviceWearUploadPackage): DeviceWearLocalVerification {
+        val localPackage =
+            loadLocalDeviceWearPackage()
+                ?: return DeviceWearLocalVerification(
+                    verified = false,
+                    expectedCount = uploadPackage.expectedWearPoints.size,
+                    matchedCount = 0,
+                    missingCount = uploadPackage.expectedWearPoints.size,
+                    mismatchedCount = 0,
+                )
+        val expected = normalizedWearPointMap(uploadPackage.expectedWearPoints)
+        val local = normalizedWearPointMap(localPackage.expectedWearPoints)
+        var matchedCount = 0
+        var missingCount = 0
+        var mismatchedCount = 0
+        expected.forEach { (slot, worn) ->
+            val localWorn = local[slot]
+            when {
+                localWorn == null -> missingCount += 1
+                localWorn == worn -> matchedCount += 1
+                else -> mismatchedCount += 1
+            }
+        }
+        return DeviceWearLocalVerification(
+            verified = expected.isNotEmpty() && matchedCount == expected.size && missingCount == 0 && mismatchedCount == 0,
+            expectedCount = expected.size,
+            matchedCount = matchedCount,
+            missingCount = missingCount,
+            mismatchedCount = mismatchedCount,
+        )
+    }
+
+    private fun resumePendingLocalWearUploadIfNeeded(): Boolean {
+        val phase = prefs.getString(KEY_DEVICE_SYNC_PHASE, null)
+        if (!pendingDeviceWearFile().exists()) {
+            return false
+        }
+        if (phase !in setOf(DEVICE_SYNC_PHASE_CLEARING, DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, DEVICE_SYNC_PHASE_CLOUD_UPLOADING)) {
+            return false
+        }
+        val uploadPackage = loadLocalDeviceWearPackage() ?: return false
+        latestUploadDeviceName = uploadPackage.deviceName
+        latestUploadStatus = "检测到手机本地有待上传佩戴数据，正在上传云端"
+        bluetoothStatusMessage = latestUploadStatus
+        setHomeBluetoothWarning(DEVICE_SYNC_INTERRUPTED_WARNING_MESSAGE)
+        updateBluetoothUploadValidation(uploadPackage, latestUploadStatus, completed = false)
+        uploadLocalDeviceWearPackage(uploadPackage)
+        return true
+    }
+
+    private fun uploadLocalDeviceWearPackage(uploadPackage: DeviceWearUploadPackage) {
+        if (deviceSyncUploading || deviceSyncCompleted) {
+            return
+        }
         deviceSyncUploading = true
         bluetoothStatusMessage = deviceReadingMessage
-        updateBluetoothUploadValidation(uploadPackage, "正在上传云端", completed = false)
+        updateBluetoothUploadValidation(uploadPackage, "正在从手机本地上传云端", completed = false)
+        updateDeviceWearArchiveUploadStatus(uploadPackage, "uploading", cloudVerified = false)
+        markDeviceSyncPhase(DEVICE_SYNC_PHASE_CLOUD_UPLOADING, "正在从手机本地上传云端")
         refreshBluetoothUi()
-
-        thread(name = "SpinecareDeviceWearUpload") {
+        thread(name = "SpinecareLocalWearUpload") {
             runCatching {
-                postJson(ApiConfig.endpoint("/api/v1/wear/device-sync"), uploadPackage.payload)
-            }.onSuccess { response ->
-                mainHandler.post {
+                val localPackage = loadLocalDeviceWearPackage() ?: uploadPackage
+                val response = postJson(ApiConfig.endpoint("/api/v1/wear/device-sync"), localPackage.payload)
+                val verification =
                     if (response.optBoolean("ok", false)) {
-                        deviceSyncUploading = false
-                        deviceSyncInProgress = false
-                        deviceSyncCompleted = true
-                        spineBraceBluetooth.clearMonthlyDataWithCurrentTime(reportStatus = false)
-                        bluetoothStatusMessage = deviceReadCompleteMessage
-                        updateBluetoothUploadValidation(uploadPackage, "云端上传完成", completed = true)
-                        loadHomeWearData(force = true)
-                        Toast.makeText(this, deviceReadCompleteMessage, Toast.LENGTH_SHORT).show()
+                        verifyCloudHasUploadedWearPoints(localPackage)
                     } else {
-                        deviceSyncUploading = false
-                        deviceSyncInProgress = false
-                        bluetoothStatusMessage = "数据上传失败，请稍后重试"
-                        updateBluetoothUploadValidation(uploadPackage, "云端上传失败", completed = true)
+                        DeviceWearCloudVerification(
+                            verified = false,
+                            expectedCount = localPackage.expectedWearPoints.size,
+                            matchedCount = 0,
+                            missingCount = localPackage.expectedWearPoints.size,
+                            mismatchedCount = 0,
+                        )
                     }
+                Triple(localPackage, response, verification)
+            }.onSuccess { (localPackage, response, verification) ->
+                mainHandler.post {
+                    deviceSyncUploading = false
+                    deviceSyncInProgress = false
+                    if (response.optBoolean("ok", false) && verification.verified) {
+                        deviceSyncCompleted = true
+                        bluetoothStatusMessage = deviceReadCompleteMessage
+                        updateBluetoothUploadValidation(localPackage, "云端核对完成，手机本地归档已保留", completed = true)
+                        updateDeviceWearArchiveUploadStatus(localPackage, "success", cloudVerified = true)
+                        deleteLocalDeviceWearPackage()
+                        clearDeviceSyncPhase()
+                        loadHomeWearData(force = true)
+                    } else if (response.optBoolean("ok", false)) {
+                        deviceSyncCompleted = false
+                        bluetoothStatusMessage = "云端核对失败；手机本地数据已保留，将稍后重试"
+                        updateBluetoothUploadValidation(
+                            localPackage,
+                            "云端核对失败：匹配${verification.matchedCount}/${verification.expectedCount}，缺失${verification.missingCount}，不一致${verification.mismatchedCount}",
+                            completed = true,
+                        )
+                        updateDeviceWearArchiveUploadStatus(localPackage, "failed", cloudVerified = false, note = bluetoothStatusMessage)
+                        markDeviceSyncPhase(DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, bluetoothStatusMessage)
+                    } else {
+                        deviceSyncCompleted = false
+                        bluetoothStatusMessage = "云端上传失败；手机本地数据已保留，将稍后重试"
+                        updateBluetoothUploadValidation(localPackage, "云端上传失败，本地数据已保留", completed = true)
+                        updateDeviceWearArchiveUploadStatus(localPackage, "failed", cloudVerified = false, note = bluetoothStatusMessage)
+                        markDeviceSyncPhase(DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, bluetoothStatusMessage)
+                    }
+                    Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
                     refreshBluetoothUi()
                 }
             }.onFailure {
                 mainHandler.post {
                     deviceSyncUploading = false
                     deviceSyncInProgress = false
-                    bluetoothStatusMessage = "数据上传失败，请稍后重试"
-                    updateBluetoothUploadValidation(uploadPackage, "云端上传失败", completed = true)
+                    deviceSyncCompleted = false
+                    bluetoothStatusMessage = "云端上传失败；手机本地数据已保留，将稍后重试"
+                    updateBluetoothUploadValidation(uploadPackage, "云端上传失败，本地数据已保留", completed = true)
+                    updateDeviceWearArchiveUploadStatus(uploadPackage, "failed", cloudVerified = false, note = bluetoothStatusMessage)
+                    markDeviceSyncPhase(DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, bluetoothStatusMessage)
                     Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
                     refreshBluetoothUi()
                 }
@@ -3727,11 +4991,98 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun payloadHourlyRows(payload: JSONObject): List<BluetoothValidationHour> {
+        val records = payload.optJSONArray("records") ?: return emptyList()
+        val rows = mutableListOf<BluetoothValidationHour>()
+        for (index in 0 until records.length()) {
+            val item = records.optJSONObject(index) ?: continue
+            val date =
+                runCatching {
+                    LocalDate.parse(item.optString("date", ""))
+                }.getOrNull() ?: continue
+            val intervals = JSONObject().put("hourly_records", item.optJSONArray("hourly_records") ?: JSONArray())
+            rows += parseWearHourlyRows(date, intervals)
+        }
+        return rows.sortedBy { it.hourStart }
+    }
+
+    private fun localWearPointsFromPayload(payload: JSONObject): List<SpineBraceWearPoint> {
+        val records = payload.optJSONArray("records") ?: return emptyList()
+        val points = mutableListOf<SpineBraceWearPoint>()
+        for (recordIndex in 0 until records.length()) {
+            val record = records.optJSONObject(recordIndex) ?: continue
+            val hours = record.optJSONArray("hourly_records") ?: continue
+            for (hourIndex in 0 until hours.length()) {
+                val hour = hours.optJSONObject(hourIndex) ?: continue
+                val samples = hour.optJSONArray("samples") ?: continue
+                for (sampleIndex in 0 until samples.length()) {
+                    val sample = samples.optJSONObject(sampleIndex) ?: continue
+                    val recordedAt =
+                        parseCloudDateTime(sample.optString("recorded_at", ""))
+                            ?: continue
+                    points += SpineBraceWearPoint(
+                        recordedAt = normalizeWearSampleSlot(recordedAt),
+                        worn = sample.optBoolean("worn", false),
+                    )
+                }
+            }
+        }
+        return normalizedWearPointMap(points)
+            .map { (recordedAt, worn) -> SpineBraceWearPoint(recordedAt, worn) }
+            .sortedBy { it.recordedAt }
+    }
+
+    private fun normalizedWearPointMap(points: List<SpineBraceWearPoint>): Map<LocalDateTime, Boolean> =
+        points
+            .map { it.copy(recordedAt = normalizeWearSampleSlot(it.recordedAt)) }
+            .groupBy { it.recordedAt }
+            .mapValues { (_, samples) -> samples.all { it.worn } }
+
+    private fun verifyCloudHasUploadedWearPoints(uploadPackage: DeviceWearUploadPackage): DeviceWearCloudVerification {
+        val expected =
+            normalizedWearPointMap(uploadPackage.expectedWearPoints)
+        if (expected.isEmpty()) {
+            return DeviceWearCloudVerification(
+                verified = false,
+                expectedCount = 0,
+                matchedCount = 0,
+                missingCount = 0,
+                mismatchedCount = 0,
+            )
+        }
+        val encodedChildId = urlEncode(uploadPackage.childId)
+        val records = parseWearRecords(getJson(ApiConfig.endpoint("/api/v1/wear/records?child_id=$encodedChildId&days=90")))
+        val cloudSamples = mutableMapOf<LocalDateTime, Boolean>()
+        records.forEach { record ->
+            record.hourlyRows.forEach { hour ->
+                hour.samples.forEach { sample ->
+                    cloudSamples[normalizeWearSampleSlot(sample.recordedAt)] = sample.worn
+                }
+            }
+        }
+        var matchedCount = 0
+        var missingCount = 0
+        var mismatchedCount = 0
+        expected.forEach { (slot, worn) ->
+            val cloudWorn = cloudSamples[slot]
+            when {
+                cloudWorn == null -> missingCount += 1
+                cloudWorn == worn -> matchedCount += 1
+                else -> mismatchedCount += 1
+            }
+        }
+        return DeviceWearCloudVerification(
+            verified = matchedCount == expected.size && missingCount == 0 && mismatchedCount == 0,
+            expectedCount = expected.size,
+            matchedCount = matchedCount,
+            missingCount = missingCount,
+            mismatchedCount = mismatchedCount,
+        )
+    }
+
     private fun snapshotLooksLikeClearedDeviceHistory(snapshot: SpineBraceHistorySnapshot): Boolean =
         snapshot.complete &&
-            snapshot.points.isNotEmpty() &&
-            snapshot.wornBits == 0 &&
-            snapshot.points.none { it.worn }
+            snapshot.header?.count == 0
 
     private fun updateBluetoothUploadValidation(
         uploadPackage: DeviceWearUploadPackage,
@@ -3740,6 +5091,9 @@ class MainActivity : AppCompatActivity() {
     ) {
         latestUploadValidationRows = uploadPackage.hourlyRows
         latestUploadFetchedAt = uploadPackage.fetchedAt
+        latestUploadLastReadAt = uploadPackage.lastReadAt
+        latestUploadHistoryHead = uploadPackage.historyHead
+        latestUploadHistoryCount = uploadPackage.historyCount
         latestUploadCompletedAt = if (completed) LocalDateTime.now() else null
         latestUploadDailyCount = uploadPackage.dailyCount
         latestUploadTotalWornHours = uploadPackage.totalWornHours
@@ -3771,7 +5125,7 @@ class MainActivity : AppCompatActivity() {
                     wearCloudLoadedChildId = targetChildId
                     wearCloudLoading = false
                     wearCloudStatusMessage = null
-                    if (stage == Stage.App && (currentTab == MainTab.Home || currentTab == MainTab.Consult || currentTab == MainTab.Reports)) {
+                    if (stage == Stage.App && (currentTab == MainTab.Home || currentTab == MainTab.Consult || currentTab == MainTab.Reports || currentTab == MainTab.BluetoothValidation)) {
                         render()
                     }
                 }
@@ -3783,7 +5137,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     wearCloudLoading = false
                     wearCloudStatusMessage = "云端佩戴数据读取失败，请稍后重试"
-                    if (stage == Stage.App && (currentTab == MainTab.Home || currentTab == MainTab.Consult || currentTab == MainTab.Reports)) {
+                    if (stage == Stage.App && (currentTab == MainTab.Home || currentTab == MainTab.Consult || currentTab == MainTab.Reports || currentTab == MainTab.BluetoothValidation)) {
                         render()
                     }
                 }
@@ -3800,15 +5154,50 @@ class MainActivity : AppCompatActivity() {
                 runCatching {
                     LocalDate.parse(item.optString("record_date"))
                 }.getOrNull() ?: continue
+            val intervals = item.optJSONObject("intervals_json")
             records.add(
                 WearRecord(
                     date = date,
                     wornHours = item.optDouble("worn_hours", 0.0).coerceIn(0.0, 24.0),
-                    hourlyRows = parseWearHourlyRows(date, item.optJSONObject("intervals_json")),
+                    lastReadAt = parseWearRawLastReadAt(intervals),
+                    historyHead = parseWearRawInt(intervals, "history_head"),
+                    historyCount = parseWearRawInt(intervals, "history_count"),
+                    hourlyRows = parseWearHourlyRows(date, intervals),
                 ),
             )
         }
         return records.sortedBy { it.date }
+    }
+
+    private fun parseWearRawLastReadAt(intervals: JSONObject?): LocalDateTime? {
+        val raw = intervals?.optJSONObject("raw") ?: return null
+        return parseCloudDateTime(raw.optString("last_read_at", ""))
+            ?: parseCloudDateTime(raw.optString("device_time", ""))
+    }
+
+    private fun parseWearRawInt(intervals: JSONObject?, key: String): Int? {
+        val raw = intervals?.optJSONObject("raw") ?: return null
+        if (!raw.has(key) || raw.isNull(key)) {
+            return null
+        }
+        return raw.optInt(key, -1).takeIf { it >= 0 }
+    }
+
+    private fun parseCloudDateTime(text: String): LocalDateTime? {
+        val value = text.trim()
+        if (value.isEmpty() || value == "null" || value == "--") {
+            return null
+        }
+        val normalized =
+            value
+                .substringBefore(".")
+                .replace(" ", "T")
+                .let { candidate ->
+                    if (candidate.count { it == ':' } == 1) "$candidate:00" else candidate
+                }
+        return runCatching {
+            LocalDateTime.parse(normalized)
+        }.getOrNull()
     }
 
     private fun parseWearHourlyRows(date: LocalDate, intervals: JSONObject?): List<BluetoothValidationHour> {
@@ -3829,9 +5218,49 @@ class MainActivity : AppCompatActivity() {
                         date.atTime(hour.coerceIn(0, 23), 0)
                     }
                 }.getOrNull() ?: continue
+            val sampleRows = mutableListOf<BluetoothValidationSample>()
+            val samplesJson = item.optJSONArray("samples")
+            if (samplesJson != null) {
+                for (sampleIndex in 0 until samplesJson.length()) {
+                    val sample = samplesJson.optJSONObject(sampleIndex) ?: continue
+                    val recordedAtText = sample.optString("recorded_at", "")
+                    val recordedAt =
+                        runCatching {
+                            val normalized = recordedAtText.replace(" ", "T").let { value ->
+                                if (value.count { it == ':' } == 1) "$value:00" else value
+                            }
+                            normalizeWearSampleSlot(LocalDateTime.parse(normalized))
+                        }.getOrNull() ?: continue
+                    sampleRows += BluetoothValidationSample(
+                        recordedAt = recordedAt,
+                        worn = sample.optBoolean("worn", false),
+                    )
+                }
+            }
+            val normalizedSamples =
+                sampleRows
+                    .groupBy { it.recordedAt }
+                    .map { (slot, samples) ->
+                        BluetoothValidationSample(
+                            recordedAt = slot,
+                            worn = samples.all { it.worn },
+                        )
+                    }
+                    .sortedBy { it.recordedAt }
+            val parsedSampleCount = normalizedSamples.size.coerceIn(0, 6)
+            val parsedWornCount = normalizedSamples.count { it.worn }.coerceIn(0, 6)
+            val fallbackWornHours = item.optDouble("worn_hours", 0.0).coerceIn(0.0, 1.0)
+            val fallbackWornCount =
+                item.optInt(
+                    "worn_count",
+                    (fallbackWornHours * 6).roundToInt(),
+                ).coerceIn(0, 6)
             result += BluetoothValidationHour(
                 hourStart = hourStart.withMinute(0).withSecond(0).withNano(0),
-                wornHours = item.optDouble("worn_hours", 0.0).coerceIn(0.0, 1.0),
+                wornHours = if (normalizedSamples.isNotEmpty()) roundOne(parsedWornCount / 6.0) else fallbackWornHours,
+                sampleCount = if (normalizedSamples.isNotEmpty()) parsedSampleCount else item.optInt("sample_count", 6).coerceIn(0, 6),
+                wornCount = if (normalizedSamples.isNotEmpty()) parsedWornCount else fallbackWornCount,
+                samples = normalizedSamples,
             )
         }
         return result.sortedBy { it.hourStart }
@@ -3867,12 +5296,45 @@ class MainActivity : AppCompatActivity() {
         val monthlyGrowthDelta = growthDeltaWithinDays(31)
 
         val insights = mutableListOf<String>()
-        insights += "云端已读取${records35.size}天佩戴记录；近30天平均${formatHours(summary30.avgHours)}/${formatHours(target)}h，达标${records30.count { isWearCompliant(it) }}/${records30.size}天，达标率${summary30.complianceRate}%。"
+        val compliant30 = records30.count { isWearCompliant(it) }
+        insights += languageText(
+            "云端已读取${records35.size}天佩戴记录；近30天平均${formatHours(summary30.avgHours)}/${formatHours(target)}h，达标${compliant30}/${records30.size}天，达标率${summary30.complianceRate}%。",
+            "Cloud loaded ${records35.size} days of wearing records; 30-day average ${formatHours(summary30.avgHours)}/${formatHours(target)}h; met ${compliant30}/${records30.size} days; compliance ${summary30.complianceRate}%.",
+            "クラウドから${records35.size}日の装着記録を読み取り済み。30日平均${formatHours(summary30.avgHours)}/${formatHours(target)}h、達成${compliant30}/${records30.size}日、達成率${summary30.complianceRate}%。",
+            "클라우드에서 ${records35.size}일 착용 기록을 읽었습니다. 30일 평균 ${formatHours(summary30.avgHours)}/${formatHours(target)}h, 달성 ${compliant30}/${records30.size}일, 달성률 ${summary30.complianceRate}%.",
+            "Nube cargada con ${records35.size} días de uso; media de 30 días ${formatHours(summary30.avgHours)}/${formatHours(target)}h; cumple ${compliant30}/${records30.size} días; cumplimiento ${summary30.complianceRate}%.",
+            "Cloud chargé avec ${records35.size} jours de port ; moyenne 30 jours ${formatHours(summary30.avgHours)}/${formatHours(target)}h ; atteint ${compliant30}/${records30.size} jours ; observance ${summary30.complianceRate}%.",
+            "Cloud mit ${records35.size} Tagen Tragedaten geladen; 30-Tage-Schnitt ${formatHours(summary30.avgHours)}/${formatHours(target)}h; erfüllt ${compliant30}/${records30.size} Tage; Erfüllung ${summary30.complianceRate}%.",
+        )
         insights +=
             when {
-                summary30.complianceRate >= 80 -> "近30天达标率良好，建议继续保持当前佩戴节奏。"
-                summary30.complianceRate >= 50 -> "近30天达标率一般，建议优先补足固定缺口时段。"
-                else -> "近30天达标率偏低，建议尽快与医生或支具师沟通佩戴困难。"
+                summary30.complianceRate >= 80 -> languageText(
+                    "近30天达标率良好，建议继续保持当前佩戴节奏。",
+                    "30-day compliance is good. Keep the current wearing routine.",
+                    "30日達成率は良好です。現在の装着リズムを維持してください。",
+                    "30일 달성률이 양호합니다. 현재 착용 리듬을 유지하세요.",
+                    "El cumplimiento de 30 días es bueno. Mantén el ritmo actual de uso.",
+                    "L'observance sur 30 jours est bonne. Gardez le rythme actuel de port.",
+                    "Die 30-Tage-Erfüllung ist gut. Bitte den aktuellen Tragerhythmus beibehalten.",
+                )
+                summary30.complianceRate >= 50 -> languageText(
+                    "近30天达标率一般，建议优先补足固定缺口时段。",
+                    "30-day compliance is fair. Prioritize filling the recurring gap periods.",
+                    "30日達成率は普通です。固定的な不足時間帯を優先して補ってください。",
+                    "30일 달성률이 보통입니다. 반복되는 부족 시간대를 우선 보완하세요.",
+                    "El cumplimiento de 30 días es medio. Prioriza cubrir los periodos con brechas repetidas.",
+                    "L'observance sur 30 jours est moyenne. Comblez d'abord les périodes de manque récurrentes.",
+                    "Die 30-Tage-Erfüllung ist mittel. Wiederkehrende Lücken zuerst ausgleichen.",
+                )
+                else -> languageText(
+                    "近30天达标率偏低，建议尽快与医生或支具师沟通佩戴困难。",
+                    "30-day compliance is low. Please discuss wearing difficulties with the doctor or brace specialist soon.",
+                    "30日達成率は低めです。装着の難しさを早めに医師または装具士へ相談してください。",
+                    "30일 달성률이 낮습니다. 착용 어려움을 의사 또는 보조기 전문가와 곧 상담하세요.",
+                    "El cumplimiento de 30 días es bajo. Consulta pronto las dificultades de uso con el médico o el técnico ortopédico.",
+                    "L'observance sur 30 jours est faible. Parlez rapidement des difficultés de port avec le médecin ou l'orthoprothésiste.",
+                    "Die 30-Tage-Erfüllung ist niedrig. Bitte Trageschwierigkeiten zeitnah mit dem Arzt oder Orthopädietechniker besprechen.",
+                )
             }
         previousAvg?.let { before ->
             val delta = roundOne(recentAvg - before)
@@ -3929,7 +5391,16 @@ class MainActivity : AppCompatActivity() {
         val monthlyGrowthDelta = growthDeltaWithinDays(31)
 
         val lines = mutableListOf<String>()
-        lines += "云端已读取${records35.size}天佩戴记录；近30天平均${formatHours(summary30.avgHours)}h/天，医嘱${formatHours(target)}h/天，达标${records30.count { isWearCompliant(it) }}/${records30.size}天，达标率${summary30.complianceRate}%。近7天平均${formatHours(recentAvg)}h/天，达标${recentCompliantDays}/${recent7.size}天。"
+        val compliant30 = records30.count { isWearCompliant(it) }
+        lines += languageText(
+            "云端已读取${records35.size}天佩戴记录；近30天平均${formatHours(summary30.avgHours)}h/天，医嘱${formatHours(target)}h/天，达标${compliant30}/${records30.size}天，达标率${summary30.complianceRate}%。近7天平均${formatHours(recentAvg)}h/天，达标${recentCompliantDays}/${recent7.size}天。",
+            "Cloud loaded ${records35.size} days of wearing records; 30-day average ${formatHours(summary30.avgHours)}h/day, prescribed ${formatHours(target)}h/day, met ${compliant30}/${records30.size} days, compliance ${summary30.complianceRate}%. 7-day average ${formatHours(recentAvg)}h/day, met ${recentCompliantDays}/${recent7.size} days.",
+            "クラウドから${records35.size}日の装着記録を読み取り済み。30日平均${formatHours(summary30.avgHours)}h/日、指示${formatHours(target)}h/日、達成${compliant30}/${records30.size}日、達成率${summary30.complianceRate}%。7日平均${formatHours(recentAvg)}h/日、達成${recentCompliantDays}/${recent7.size}日。",
+            "클라우드에서 ${records35.size}일 착용 기록을 읽었습니다. 30일 평균 ${formatHours(summary30.avgHours)}h/일, 처방 ${formatHours(target)}h/일, 달성 ${compliant30}/${records30.size}일, 달성률 ${summary30.complianceRate}%. 7일 평균 ${formatHours(recentAvg)}h/일, 달성 ${recentCompliantDays}/${recent7.size}일.",
+            "Nube cargada con ${records35.size} días de uso; media 30 días ${formatHours(summary30.avgHours)}h/día, prescrito ${formatHours(target)}h/día, cumple ${compliant30}/${records30.size} días, cumplimiento ${summary30.complianceRate}%. Media 7 días ${formatHours(recentAvg)}h/día, cumple ${recentCompliantDays}/${recent7.size} días.",
+            "Cloud chargé avec ${records35.size} jours de port ; moyenne 30 jours ${formatHours(summary30.avgHours)}h/jour, prescription ${formatHours(target)}h/jour, atteint ${compliant30}/${records30.size} jours, observance ${summary30.complianceRate}%. Moyenne 7 jours ${formatHours(recentAvg)}h/jour, atteint ${recentCompliantDays}/${recent7.size} jours.",
+            "Cloud mit ${records35.size} Tagen Tragedaten geladen; 30-Tage-Schnitt ${formatHours(summary30.avgHours)}h/Tag, verordnet ${formatHours(target)}h/Tag, erfüllt ${compliant30}/${records30.size} Tage, Erfüllung ${summary30.complianceRate}%. 7-Tage-Schnitt ${formatHours(recentAvg)}h/Tag, erfüllt ${recentCompliantDays}/${recent7.size} Tage.",
+        )
         if (gapHours.isNotEmpty()) {
             lines += "小时明细显示主要缺口集中在${gapHours.joinToString("、")}。"
         }
@@ -4085,6 +5556,11 @@ class MainActivity : AppCompatActivity() {
         } else {
             String.format(Locale.US, "%.1f", value)
         }
+
+    private fun formatReadDataDuration(count: Int): String {
+        val minutes = count.coerceAtLeast(0) * 10
+        return "${minutes}分钟（${count.coerceAtLeast(0)}个10分钟点）"
+    }
 
     private fun urlEncode(value: String): String =
         URLEncoder.encode(value, Charsets.UTF_8.name())
@@ -4913,6 +6389,7 @@ class MainActivity : AppCompatActivity() {
         verificationCode = prefs.getString(KEY_VERIFICATION_CODE, verificationCode) ?: verificationCode
         loginMethod = prefs.getString(KEY_LOGIN_METHOD, loginMethod) ?: loginMethod
         consentChecked = prefs.getBoolean(KEY_CONSENT_CHECKED, consentChecked)
+        agreementReadConfirmed = prefs.getBoolean(KEY_LOGIN_AGREEMENT_READ, consentChecked)
         child.id = prefs.getString(KEY_PROFILE_ID, child.id) ?: child.id
         child.nickname = prefs.getString(KEY_PROFILE_NICKNAME, child.nickname) ?: child.nickname
         child.gender = prefs.getString(KEY_PROFILE_GENDER, child.gender) ?: child.gender
@@ -4932,6 +6409,7 @@ class MainActivity : AppCompatActivity() {
             .putString(KEY_VERIFICATION_CODE, verificationCode)
             .putString(KEY_LOGIN_METHOD, loginMethod)
             .putBoolean(KEY_CONSENT_CHECKED, consentChecked)
+            .putBoolean(KEY_LOGIN_AGREEMENT_READ, agreementReadConfirmed)
             .putString(KEY_PROFILE_ID, child.id)
             .putString(KEY_PROFILE_NICKNAME, child.nickname)
             .putString(KEY_PROFILE_GENDER, child.gender)
@@ -4964,6 +6442,9 @@ class MainActivity : AppCompatActivity() {
         loginMethod = profile.optNonBlankString("login_method", loginMethod)
         if (profile.has("consent_accepted") && !profile.isNull("consent_accepted")) {
             consentChecked = profile.optBoolean("consent_accepted", consentChecked)
+            if (consentChecked) {
+                agreementReadConfirmed = true
+            }
         }
     }
 
@@ -5012,14 +6493,34 @@ class MainActivity : AppCompatActivity() {
     private fun isIsoDate(value: String): Boolean =
         Regex("""\d{4}-\d{2}-\d{2}""").matches(value.trim())
 
+    private fun wearPointsForUpload(snapshot: SpineBraceHistorySnapshot): List<SpineBraceWearPoint> {
+        return snapshot.points
+            .sortedBy { it.recordedAt }
+            .map { it.copy(recordedAt = normalizeWearSampleSlot(it.recordedAt)) }
+            .groupBy { it.recordedAt }
+            .map { (slot, samples) ->
+                SpineBraceWearPoint(
+                    recordedAt = slot,
+                    worn = samples.all { it.worn },
+                )
+            }
+            .sortedBy { it.recordedAt }
+    }
+
+    private fun normalizeWearSampleSlot(value: LocalDateTime): LocalDateTime {
+        val minute = (value.minute / 10) * 10
+        return value.withMinute(minute).withSecond(0).withNano(0)
+    }
+
     private fun buildDeviceWearUploadPayload(
         snapshot: SpineBraceHistorySnapshot,
         device: SpineBraceDevice?,
     ): DeviceWearUploadPackage {
-        val hourlyRows = bluetoothValidationHours(snapshot)
+        val uploadPoints = wearPointsForUpload(snapshot)
+        val hourlyRows = bluetoothValidationHours(uploadPoints)
         val hourlyRowsByDate = hourlyRows.groupBy { it.hourStart.toLocalDate() }
         val records = JSONArray()
-        snapshot.points
+        uploadPoints
             .groupBy { it.recordedAt.toLocalDate() }
             .toSortedMap()
             .forEach { (date, points) ->
@@ -5027,10 +6528,21 @@ class MainActivity : AppCompatActivity() {
                 val wornHours = ((wornCount * 10f / 60f) * 10f).roundToInt() / 10f
                 val hourlyRecords = JSONArray()
                 hourlyRowsByDate[date].orEmpty().forEach { item ->
+                    val samples = JSONArray()
+                    item.samples.forEach { sample ->
+                        samples.put(
+                            JSONObject()
+                                .put("recorded_at", sample.recordedAt.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+                                .put("worn", sample.worn),
+                        )
+                    }
                     hourlyRecords.put(
                         JSONObject()
                             .put("hour_start", formatValidationHour(item.hourStart))
-                            .put("worn_hours", item.wornHours),
+                            .put("worn_hours", item.wornHours)
+                            .put("sample_count", item.sampleCount)
+                            .put("worn_count", item.wornCount)
+                            .put("samples", samples),
                     )
                 }
                 records.put(
@@ -5051,8 +6563,19 @@ class MainActivity : AppCompatActivity() {
                 .put("worn_bits", snapshot.wornBits)
                 .put("complete", snapshot.complete)
                 .put("app_project", ApiConfig.projectCode)
+                .put("history_zero_bit_means_worn", SpineBraceBluetoothManager.HISTORY_ZERO_BIT_MEANS_WORN)
+                .put("current_telemetry_included", false)
+                .put("current_telemetry_saved_to_wear_records", false)
+                .put("current_telemetry_worn", latestBraceTelemetry?.worn ?: JSONObject.NULL)
+                .put("device_history_clear_required_after_cloud_verify", false)
+                .put("device_history_clear_policy", "clear_after_local_verify_before_cloud_upload")
+        val lastReadAt = snapshot.header?.lastReadAt
         snapshot.header?.let { header ->
+            raw.put("last_read_at", lastReadAt?.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME) ?: header.lastReadAtText)
+            raw.put("last_read_time_source", "04_header_time_written_by_01_clear_command")
             raw.put("device_time", header.deviceTimeText)
+            raw.put("history_head", header.head)
+            raw.put("history_count", header.count)
             raw.put("next_save_seconds", header.nextSaveSeconds)
         }
 
@@ -5064,9 +6587,14 @@ class MainActivity : AppCompatActivity() {
                 .put("records", records)
                 .put("raw", raw)
         return DeviceWearUploadPackage(
+            childId = child.id,
             payload = payload,
             hourlyRows = hourlyRows,
+            expectedWearPoints = uploadPoints,
             fetchedAt = latestHistoryReceivedAt ?: LocalDateTime.now(),
+            lastReadAt = lastReadAt,
+            historyHead = snapshot.header?.head,
+            historyCount = snapshot.header?.count,
             dailyCount = records.length(),
             totalWornHours = roundOne(hourlyRows.sumOf { it.wornHours }),
             deviceName = device?.name,
@@ -5310,6 +6838,7 @@ class MainActivity : AppCompatActivity() {
         FrameLayout(this).apply {
             addView(
                 iconButton("🔔", "消息") {
+                    alertsBackTarget = currentTab
                     currentTab = MainTab.Alerts
                     render()
                 },
@@ -5331,7 +6860,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-    private fun unreadAlertCount(): Int = 2
+    private fun unreadAlertCount(): Int =
+        if (alertsLoadedChildId == child.id) {
+            alertItems.count { it.isPendingAlert() }
+        } else {
+            0
+        }
 
     private fun brandMark(): View =
         TextView(this).apply {
@@ -5551,7 +7085,7 @@ class MainActivity : AppCompatActivity() {
             background = quickCardBackground(accent)
             addView(
                 TextView(this@MainActivity).apply {
-                    text = icon
+                    text = uiText(icon)
                     textSize = 16f
                     typeface = Typeface.DEFAULT_BOLD
                     gravity = Gravity.CENTER
@@ -5603,7 +7137,7 @@ class MainActivity : AppCompatActivity() {
 
                 val iconView =
                     TextView(this@MainActivity).apply {
-                        text = icon
+                        text = uiText(icon)
                         textSize = if (icon.length > 1) 14f else 18f
                         typeface = Typeface.DEFAULT_BOLD
                         gravity = Gravity.CENTER
@@ -5811,7 +7345,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(12), dp(12), dp(12), dp(12))
             addView(
                 TextView(this@MainActivity).apply {
-                    text = "片"
+                    text = uiText("片")
                     textSize = 16f
                     typeface = Typeface.DEFAULT_BOLD
                     gravity = Gravity.CENTER
@@ -5918,6 +7452,126 @@ class MainActivity : AppCompatActivity() {
                 },
                 weightLp(1f),
             )
+        }
+
+    private fun alertRow(item: AlertItem): View =
+        vertical {
+            val color = alertLevelColor(item.level)
+            background = rounded(P.surfaceAlt, dp(8), adjustAlpha(color, 0.18f))
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            addView(
+                horizontal {
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(chip(alertLevelText(item.level), color), widthLp(dp(48)))
+                    addSpace(10, horizontal = true)
+                    addView(
+                        vertical {
+                            addView(label(item.title, 15f, P.text, Typeface.BOLD))
+                            item.summary.takeIf { it.isNotBlank() && it != "null" }?.let { summary ->
+                                addView(label(summary, 13f, P.secondary))
+                            }
+                        },
+                        weightLp(1f),
+                    )
+                    addSpace(8, horizontal = true)
+                    addView(chip(alertStatusText(item), if (item.isPendingAlert()) P.warning else P.success))
+                },
+            )
+            item.triggerDetail.takeIf { it.isNotBlank() && it != "null" }?.let { detail ->
+                addSpace(8)
+                addView(label(detail, 13f, P.secondary).apply {
+                    background = rounded(P.surface, dp(8), P.softLine)
+                    setPadding(dp(10), dp(8), dp(10), dp(8))
+                })
+            }
+            addSpace(8)
+            addView(
+                horizontal {
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(label("时间：${archiveCreatedAtText(item.createdAt)}", 12f, P.muted), weightLp(1f))
+                    if (item.isPendingAlert()) {
+                        val handling = handlingAlertIds.contains(item.id)
+                        addSpace(8, horizontal = true)
+                        addView(
+                            primaryButton(if (handling) "处理中" else "处理") {
+                                if (!handling) {
+                                    handleAlert(item)
+                                }
+                            }.apply {
+                                isEnabled = !handling
+                                alpha = if (handling) 0.55f else 1f
+                            },
+                            widthLp(dp(84)),
+                        )
+                    }
+                },
+            )
+        }
+
+    private fun handleAlert(item: AlertItem) {
+        if (!item.isPendingAlert() || !handlingAlertIds.add(item.id)) {
+            return
+        }
+        render()
+        thread(name = "SpinecareAlertHandle") {
+            runCatching {
+                postJson(ApiConfig.endpoint("/api/v1/alerts/${urlEncode(item.id)}/handle"), JSONObject())
+            }.onSuccess {
+                mainHandler.post {
+                    handlingAlertIds.remove(item.id)
+                    alertItems = alertItems.map { alert -> if (alert.id == item.id) alert.copy(status = "handled") else alert }
+                    render()
+                    loadAlerts(force = true)
+                    Toast.makeText(this, "消息已处理", Toast.LENGTH_SHORT).show()
+                }
+            }.onFailure {
+                mainHandler.post {
+                    handlingAlertIds.remove(item.id)
+                    alertsStatusMessage = "消息处理失败，请稍后重试。"
+                    render()
+                    loadAlerts(force = true)
+                    Toast.makeText(this, alertsStatusMessage, Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun AlertItem.isPendingAlert(): Boolean {
+        val normalized = status.trim().lowercase(Locale.US)
+        if (normalized.isBlank() || normalized == "null") {
+            return true
+        }
+        return normalized !in setOf("handled", "processed", "resolved", "read", "closed", "done") &&
+            !status.contains("已处理") &&
+            !status.contains("已读") &&
+            !status.contains("关闭")
+    }
+
+    private fun alertStatusText(item: AlertItem): String =
+        if (item.isPendingAlert()) "待处理" else "已处理"
+
+    private fun alertLevelText(level: String): String =
+        when (level.trim().lowercase(Locale.US)) {
+            "red" -> "红"
+            "yellow" -> "黄"
+            "green" -> "绿"
+            else -> "消息"
+        }
+
+    private fun alertLevelColor(level: String): Int =
+        when (level.trim().lowercase(Locale.US)) {
+            "red" -> P.danger
+            "yellow" -> P.warning
+            "green" -> P.success
+            else -> P.primary
+        }
+
+    private fun alertLevelRank(level: String): Int =
+        when (level.trim().lowercase(Locale.US)) {
+            "red" -> 0
+            "yellow" -> 1
+            "green" -> 2
+            else -> 3
         }
 
     private fun avatar(text: String): View =
@@ -6515,16 +8169,52 @@ class MainActivity : AppCompatActivity() {
         private const val KEY_VERIFICATION_CODE = "verification_code"
         private const val KEY_LOGIN_METHOD = "login_method"
         private const val KEY_CONSENT_CHECKED = "consent_checked"
+        private const val KEY_LOGIN_AGREEMENT_READ = "login_agreement_read"
         private const val KEY_LAST_DATA_EXPORT_AT = "last_data_export_at"
+        private const val KEY_DEVICE_SYNC_PHASE = "device_sync_phase"
+        private const val KEY_DEVICE_SYNC_UPDATED_AT = "device_sync_updated_at"
+        private const val KEY_DEVICE_SYNC_DEVICE_NAME = "device_sync_device_name"
+        private const val KEY_DEVICE_SYNC_STATUS = "device_sync_status"
+        private const val DEVICE_SYNC_PHASE_READING = "reading"
+        private const val DEVICE_SYNC_PHASE_LOCAL_SAVING = "local_saving"
+        private const val DEVICE_SYNC_PHASE_LOCAL_VERIFYING = "local_verifying"
+        private const val DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD = "pending_cloud_upload"
+        private const val DEVICE_SYNC_PHASE_CLOUD_UPLOADING = "cloud_uploading"
+        private const val DEVICE_SYNC_PHASE_VERIFYING = "verifying"
+        private const val DEVICE_SYNC_PHASE_CLEARING = "clearing"
+        private const val DEVICE_SYNC_PHASE_INTERRUPTED = "interrupted"
+        private const val LOCAL_DEVICE_WEAR_SESSION_TEMP_FILE_NAME = "device_wear_session.tmp"
+        private const val LOCAL_DEVICE_WEAR_FILE_NAME = "pending_device_wear_sync.json"
+        private const val LOCAL_DEVICE_WEAR_ARCHIVE_FILE_NAME = "device_wear_local_archive.json"
         private const val DELETE_CONFIRMATION_TEXT = "删除全部数据"
+        private const val COMPANY_NAME_ZH = "绍兴维脉科技有限公司"
+        private const val COMPANY_ADDRESS_ZH = "浙江省绍兴市越城区袍中北路631号"
         private const val CONTACT_EMAIL = "zclei@vip.sina.com"
         private const val WECHAT_CONTACT_TEXT = "微信客服：Spinecare Mom"
         private const val AUTO_CONNECT_SCAN_TIMEOUT_MS = 20_000L
         private const val BLUETOOTH_AUTO_DISCONNECT_MS = 10 * 60 * 1_000L
+        private const val BLUETOOTH_AUTO_DISCONNECT_DEFER_MS = 60_000L
+        private const val DEVICE_HISTORY_INITIAL_TIMEOUT_MS = 20_000L
+        private const val DEVICE_HISTORY_PACKET_IDLE_TIMEOUT_MS = 30_000L
+        private const val MAX_DEVICE_HISTORY_READ_RETRIES = 0
+        private const val DEVICE_SYNC_RECONNECT_DELAY_MS = 1_500L
+        private const val MAX_DEVICE_SYNC_RECONNECT_RETRIES = 2
         private const val LOW_BATTERY_WARNING_MESSAGE = "电池电量小于20%，请更换电池"
         private const val AUTO_CONNECT_NOT_FOUND_MESSAGE = "没有发现蓝牙设备，请到设置界面扫描连接设备"
+        private const val DEVICE_SYNC_INTERRUPTED_WARNING_MESSAGE = "上次数据获取未完成，设备数据已保留，请靠近设备重新连接"
 
         private val exactUiTranslations = mapOf(
+            "处理" to listOf("Handle", "処理", "처리", "Procesar", "Traiter", "Bearbeiten"),
+            "处理中" to listOf("Handling", "処理中", "처리 중", "Procesando", "Traitement", "Wird bearbeitet"),
+            "消息已处理" to listOf("Message handled", "メッセージを処理しました", "메시지가 처리되었습니다", "Mensaje procesado", "Message traité", "Nachricht bearbeitet"),
+            "消息处理失败，请稍后重试。" to listOf(
+                "Failed to handle message. Please try again later.",
+                "メッセージの処理に失敗しました。後でもう一度お試しください。",
+                "메시지 처리에 실패했습니다. 나중에 다시 시도해 주세요.",
+                "No se pudo procesar el mensaje. Inténtelo de nuevo más tarde.",
+                "Impossible de traiter le message. Veuillez réessayer plus tard.",
+                "Nachricht konnte nicht bearbeitet werden. Bitte versuchen Sie es später erneut.",
+            ),
             "我已阅读并同意《隐私政策》《监护人授权告知》" to listOf(
                 "I have read and agree to the Privacy Policy and Guardian Authorization Notice",
                 "「プライバシーポリシー」と「保護者同意通知」を読み、同意します",
@@ -6533,6 +8223,67 @@ class MainActivity : AppCompatActivity() {
                 "J'ai lu et j'accepte la politique de confidentialité et l'autorisation du tuteur",
                 "Ich habe die Datenschutzrichtlinie und die Erziehungsberechtigten-Erklärung gelesen und stimme zu",
             ),
+            "我已阅读并同意《用户协议》《隐私政策》" to listOf(
+                "I have read and agree to the User Agreement and Privacy Policy",
+                "「ユーザー契約」と「プライバシーポリシー」を読み、同意します",
+                "이용약관 및 개인정보 처리방침을 읽고 동의합니다",
+                "He leído y acepto el Acuerdo de usuario y la Política de privacidad",
+                "J'ai lu et j'accepte l'accord utilisateur et la politique de confidentialité",
+                "Ich habe die Nutzungsvereinbarung und Datenschutzrichtlinie gelesen und stimme zu",
+            ),
+            "用户协议与隐私政策" to listOf(
+                "User Agreement and Privacy Policy",
+                "ユーザー契約とプライバシーポリシー",
+                "이용약관 및 개인정보 처리방침",
+                "Acuerdo de usuario y Política de privacidad",
+                "Accord utilisateur et politique de confidentialité",
+                "Nutzungsvereinbarung und Datenschutzrichtlinie",
+            ),
+            "登录前请先阅读用户协议和隐私政策。阅读完毕后勾选同意，才可以登录。" to listOf(
+                "Please read the User Agreement and Privacy Policy before login. After reading, tick agreement to log in.",
+                "ログイン前にユーザー契約とプライバシーポリシーをお読みください。読了後に同意を選択するとログインできます。",
+                "로그인 전에 이용약관 및 개인정보 처리방침을 읽어 주세요. 읽은 후 동의에 체크해야 로그인할 수 있습니다.",
+                "Lee el Acuerdo de usuario y la Política de privacidad antes de iniciar sesión. Después marca la aceptación para entrar.",
+                "Veuillez lire l'accord utilisateur et la politique de confidentialité avant la connexion. Cochez l'accord après lecture pour vous connecter.",
+                "Bitte lesen Sie vor der Anmeldung Nutzungsvereinbarung und Datenschutzrichtlinie. Danach Zustimmung markieren, um sich anzumelden.",
+            ),
+            "请先阅读用户协议，阅读完毕后再勾选同意。" to listOf(
+                "Please read the User Agreement first, then tick agreement after reading.",
+                "先にユーザー契約を読み、読了後に同意を選択してください。",
+                "먼저 이용약관을 읽은 후 동의에 체크하세요.",
+                "Lee primero el Acuerdo de usuario y luego marca la aceptación.",
+                "Veuillez d'abord lire l'accord utilisateur, puis cocher l'accord.",
+                "Bitte zuerst die Nutzungsvereinbarung lesen und danach Zustimmung markieren.",
+            ),
+            "请勾选已阅读并同意后再登录。" to listOf(
+                "Please tick that you have read and agreed before logging in.",
+                "読了と同意にチェックしてからログインしてください。",
+                "읽고 동의함에 체크한 후 로그인하세요.",
+                "Marca que has leído y aceptado antes de iniciar sesión.",
+                "Veuillez cocher que vous avez lu et accepté avant de vous connecter.",
+                "Bitte vor der Anmeldung bestätigen, dass Sie gelesen und zugestimmt haben.",
+            ),
+            "查看用户协议" to listOf("View Agreement", "契約を見る", "약관 보기", "Ver acuerdo", "Voir l'accord", "Vereinbarung anzeigen"),
+            "收起用户协议" to listOf("Collapse Agreement", "契約を閉じる", "약관 접기", "Contraer acuerdo", "Réduire l'accord", "Vereinbarung einklappen"),
+            "我已阅读完毕" to listOf("I have finished reading", "読み終えました", "읽기를 완료했습니다", "He terminado de leer", "J'ai terminé la lecture", "Ich habe fertig gelesen"),
+            "已阅读，可以勾选同意并登录" to listOf(
+                "Reading confirmed. You can tick agreement and log in.",
+                "読了を確認しました。同意にチェックしてログインできます。",
+                "읽기 확인 완료. 동의에 체크하고 로그인할 수 있습니다.",
+                "Lectura confirmada. Puedes marcar la aceptación e iniciar sesión.",
+                "Lecture confirmée. Vous pouvez cocher l'accord et vous connecter.",
+                "Lesen bestätigt. Sie können Zustimmung markieren und sich anmelden.",
+            ),
+            "已阅读，请勾选同意后登录" to listOf(
+                "Reading confirmed. Please tick agreement before logging in.",
+                "読了を確認しました。ログイン前に同意を選択してください。",
+                "읽기 확인 완료. 로그인 전에 동의에 체크하세요.",
+                "Lectura confirmada. Marca la aceptación antes de iniciar sesión.",
+                "Lecture confirmée. Veuillez cocher l'accord avant de vous connecter.",
+                "Lesen bestätigt. Bitte vor der Anmeldung Zustimmung markieren.",
+            ),
+            "已阅读" to listOf("Read", "読了", "읽음", "Leído", "Lu", "Gelesen"),
+            "待阅读" to listOf("To read", "未読", "읽기 필요", "Pendiente", "À lire", "Zu lesen"),
             "输入问题..." to listOf(
                 "Enter a question...",
                 "質問を入力...",
@@ -6565,9 +8316,93 @@ class MainActivity : AppCompatActivity() {
                 "Aucun appareil Bluetooth trouvé. Scannez et connectez dans Paramètres.",
                 "Kein Bluetooth-Gerät gefunden. Bitte in den Einstellungen scannen und verbinden.",
             ),
+            "未连接设备，请扫描 WM-SP# 脊柱侧弯设备。" to listOf(
+                "Not connected. Please scan for a WM-SP# scoliosis device.",
+                "未接続です。WM-SP#脊柱側弯デバイスをスキャンしてください。",
+                "연결되지 않았습니다. WM-SP# 척추측만 장치를 스캔하세요.",
+                "Sin conexión. Escanea un dispositivo de escoliosis WM-SP#.",
+                "Non connecté. Scannez un appareil de scoliose WM-SP#.",
+                "Nicht verbunden. Bitte nach einem WM-SP#-Skoliosegerät suchen.",
+            ),
+            "正在扫描 WM-SP# 脊柱侧弯设备..." to listOf(
+                "Scanning for WM-SP# scoliosis devices...",
+                "WM-SP#脊柱側弯デバイスをスキャン中...",
+                "WM-SP# 척추측만 장치를 스캔 중...",
+                "Escaneando dispositivos de escoliosis WM-SP#...",
+                "Recherche d'appareils de scoliose WM-SP#...",
+                "Suche nach WM-SP#-Skoliosegeräten...",
+            ),
+            "扫描并连接 WM-SP# 设备，读取电量和月度佩戴记录" to listOf(
+                "Scan and connect a WM-SP# device to read battery and monthly wearing records",
+                "WM-SP#デバイスをスキャンして接続し、電池残量と月間装着記録を読み取ります",
+                "WM-SP# 장치를 스캔하고 연결하여 배터리와 월간 착용 기록을 읽습니다",
+                "Escanea y conecta un WM-SP# para leer batería y registros mensuales de uso",
+                "Scannez et connectez un WM-SP# pour lire la batterie et les dossiers mensuels de port",
+                "WM-SP# scannen und verbinden, um Batterie und monatliche Tragedaten zu lesen",
+            ),
+            "未扫描到设备。请确认支具传感器开机且蓝牙名以 WM-SP# 开头。" to listOf(
+                "No device found. Make sure the brace sensor is on and its Bluetooth name starts with WM-SP#.",
+                "デバイスが見つかりません。装具センサーの電源が入り、Bluetooth名がWM-SP#で始まることを確認してください。",
+                "장치를 찾지 못했습니다. 보조기 센서가 켜져 있고 Bluetooth 이름이 WM-SP#로 시작하는지 확인하세요.",
+                "No se encontró ningún dispositivo. Confirma que el sensor esté encendido y que el nombre Bluetooth empiece por WM-SP#.",
+                "Aucun appareil trouvé. Vérifiez que le capteur est allumé et que son nom Bluetooth commence par WM-SP#.",
+                "Kein Gerät gefunden. Prüfen Sie, ob der Sensor eingeschaltet ist und der Bluetooth-Name mit WM-SP# beginnt.",
+            ),
+            "请先扫描并选择 WM-SP# 设备" to listOf(
+                "Please scan and select a WM-SP# device first",
+                "先にWM-SP#デバイスをスキャンして選択してください",
+                "먼저 WM-SP# 장치를 스캔하고 선택하세요",
+                "Primero escanea y selecciona un dispositivo WM-SP#",
+                "Scannez puis sélectionnez d'abord un appareil WM-SP#",
+                "Bitte zuerst ein WM-SP#-Gerät scannen und auswählen",
+            ),
+            "APP 语言" to listOf("App Language", "アプリ言語", "앱 언어", "Idioma de la app", "Langue de l'app", "App-Sprache"),
+            "界面文字会按照这里的语言显示，选择后立即保存。" to listOf(
+                "Interface text follows the language selected here and is saved immediately.",
+                "画面の文字はここで選んだ言語で表示され、選択後すぐ保存されます。",
+                "화면 문구는 여기서 선택한 언어로 표시되며 즉시 저장됩니다.",
+                "El texto de la interfaz usará el idioma elegido aquí y se guardará al instante.",
+                "Le texte de l'interface suit la langue choisie ici et est enregistré immédiatement.",
+                "Die Oberfläche verwendet die hier gewählte Sprache und speichert sie sofort.",
+            ),
+            "已连接" to listOf("Connected", "接続済み", "연결됨", "Conectado", "Connecté", "Verbunden"),
+            "未连接" to listOf("Disconnected", "未接続", "연결 안 됨", "Desconectado", "Non connecté", "Nicht verbunden"),
+            "已选中" to listOf("Selected", "選択済み", "선택됨", "Seleccionado", "Sélectionné", "Ausgewählt"),
+            "选择" to listOf("Select", "選択", "선택", "Seleccionar", "Sélectionner", "Auswählen"),
+            "7种" to listOf("7 languages", "7言語", "7개 언어", "7 idiomas", "7 langues", "7 Sprachen"),
+            "正在读取设备数据 ，请稍候" to listOf(
+                "Reading device data. Please wait.",
+                "デバイスデータを読み取り中です。お待ちください。",
+                "장치 데이터를 읽는 중입니다. 잠시만 기다려 주세요.",
+                "Leyendo datos del dispositivo. Espera un momento.",
+                "Lecture des données de l'appareil. Veuillez patienter.",
+                "Gerätedaten werden gelesen. Bitte warten.",
+            ),
+            "数据读取完成" to listOf(
+                "Data reading complete.",
+                "データ読み取りが完了しました。",
+                "데이터 읽기가 완료되었습니다.",
+                "Lectura de datos completada.",
+                "Lecture des données terminée.",
+                "Datenlesen abgeschlossen.",
+            ),
+            "肤" to listOf("SK", "皮", "피부", "PIEL", "PEAU", "HAUT"),
+            "长" to listOf("HT", "身", "키", "ALT", "TAIL", "GR"),
+            "片" to listOf("IMG", "画", "영상", "IMG", "IMG", "BILD"),
+            "报" to listOf("RPT", "報", "보고", "INF", "RAP", "BER"),
+            "出" to listOf("EXP", "出", "내보", "EXP", "EXP", "EXP"),
+            "删" to listOf("DEL", "削", "삭제", "BOR", "SUP", "LÖS"),
+            "册" to listOf("MAN", "冊", "설명", "MAN", "MAN", "HAN"),
+            "问" to listOf("FAQ", "問", "질문", "FAQ", "FAQ", "FAQ"),
+            "协" to listOf("AGR", "契", "약관", "ACU", "ACC", "VER"),
+            "私" to listOf("PRI", "私", "개인", "PRI", "PRI", "DAT"),
+            "联" to listOf("CON", "連", "문의", "CON", "CON", "KON"),
+            "孩" to listOf("KID", "子", "아이", "NIÑO", "ENF", "KIND"),
         )
 
         private val uiPhraseTranslations = linkedMapOf(
+            "待处理" to listOf("Pending", "未処理", "대기 중", "Pendiente", "En attente", "Ausstehend"),
+            "已处理" to listOf("Handled", "処理済み", "처리됨", "Procesado", "Traité", "Bearbeitet"),
             "删除全部数据" to listOf("Delete All Data", "すべてのデータを削除", "전체 데이터 삭제", "Eliminar todos los datos", "Supprimer toutes les données", "Alle Daten löschen"),
             "帮助中心" to listOf("Help Center", "ヘルプセンター", "도움말 센터", "Centro de ayuda", "Centre d'aide", "Hilfezentrum"),
             "用户手册" to listOf("User Manual", "ユーザーマニュアル", "사용자 설명서", "Manual de usuario", "Manuel utilisateur", "Benutzerhandbuch"),
@@ -6579,6 +8414,196 @@ class MainActivity : AppCompatActivity() {
             "邮箱" to listOf("Email", "メール", "이메일", "Correo", "E-mail", "E-Mail"),
             "待配置" to listOf("To be configured", "未設定", "설정 예정", "Pendiente", "À configurer", "Noch zu konfigurieren"),
             "已配置" to listOf("Configured", "設定済み", "설정됨", "Configurado", "Configuré", "Konfiguriert"),
+            "生成" to listOf("Generate", "生成", "생성", "Generar", "Générer", "Erzeugen"),
+            "医嘱" to listOf("Prescribed ", "医師指示", "처방 ", "Prescrito ", "Prescription ", "Verordnet "),
+            "结合" to listOf("Based on ", "基づく", "기반 ", "Basado en ", "Basé sur ", "Basierend auf "),
+            "脊护妈妈助手" to listOf("Spinecare Mom", "Spinecare Mom", "Spinecare Mom", "Spinecare Mom", "Spinecare Mom", "Spinecare Mom"),
+            "守护孩子的每一小时佩戴" to listOf("Protect every wearing hour", "装着の一時間一時間を見守ります", "아이의 모든 착용 시간을 지킵니다", "Cuida cada hora de uso", "Accompagne chaque heure de port", "Jede Tragestunde begleiten"),
+            "手机号" to listOf("Phone", "電話番号", "휴대폰 번호", "Teléfono", "Téléphone", "Telefon"),
+            "验证码" to listOf("Code", "認証コード", "인증 코드", "Código", "Code", "Code"),
+            "获取验证码" to listOf("Get Code", "コード取得", "코드 받기", "Obtener código", "Obtenir le code", "Code anfordern"),
+            "— 或 —" to listOf("— or —", "— または —", "— 또는 —", "— o —", "— ou —", "— oder —"),
+            "暂时跳过" to listOf("Skip for now", "今はスキップ", "지금은 건너뛰기", "Omitir por ahora", "Ignorer pour l'instant", "Vorerst überspringen"),
+            "继续建档" to listOf("Continue Profile", "プロフィール作成を続行", "프로필 계속 작성", "Continuar perfil", "Continuer le dossier", "Profil fortsetzen"),
+            "建档向导" to listOf("Profile Wizard", "プロフィールウィザード", "프로필 마법사", "Asistente de perfil", "Assistant de dossier", "Profilassistent"),
+            "基础信息" to listOf("Basic Info", "基本情報", "기본 정보", "Información básica", "Infos de base", "Basisdaten"),
+            "病情信息" to listOf("Condition Info", "病状情報", "상태 정보", "Información clínica", "Infos cliniques", "Befunddaten"),
+            "医嘱与支具" to listOf("Prescription and Brace", "医師指示と装具", "처방 및 보조기", "Prescripción y corsé", "Prescription et orthèse", "Verordnung und Orthese"),
+            "进入首页" to listOf("Enter Home", "ホームへ", "홈으로", "Entrar al inicio", "Aller à l'accueil", "Zur Startseite"),
+            "设备绑定" to listOf("Device Binding", "機器登録", "장치 등록", "Vincular dispositivo", "Association d'appareil", "Gerät koppeln"),
+            "绑定" to listOf("Bind", "登録", "등록", "Vincular", "Associer", "Koppeln"),
+            "近35天云端数据已注入" to listOf("35-day cloud data loaded", "35日分のクラウドデータ読込済み", "35일 클라우드 데이터 로드됨", "Datos cloud de 35 días cargados", "35 jours de données cloud chargés", "35 Tage Cloud-Daten geladen"),
+            "结构化回答" to listOf("Structured Answer", "構造化回答", "구조화 답변", "Respuesta estructurada", "Réponse structurée", "Strukturierte Antwort"),
+            "健康教育" to listOf("Health Education", "健康教育", "건강 교육", "Educación sanitaria", "Éducation santé", "Gesundheitsinformation"),
+            "一句话总结" to listOf("One-line Summary", "一言要約", "한 줄 요약", "Resumen breve", "Résumé en une phrase", "Kurzfassung"),
+            "结合朵朵数据的分析" to listOf("Analysis Based on Duoduo's Data", "朵朵さんのデータに基づく分析", "두오두오 데이터 기반 분석", "Análisis con datos de Duoduo", "Analyse avec les données de Duoduo", "Analyse mit Duoduos Daten"),
+            "数据的分析" to listOf("Data Analysis", "データ分析", "데이터 분석", "Análisis de datos", "Analyse des données", "Datenanalyse"),
+            "可执行建议" to listOf("Actionable Advice", "実行できる提案", "실행 가능한 조언", "Consejos prácticos", "Conseils pratiques", "Umsetzbare Hinweise"),
+            "少戴2小时有影响吗？" to listOf("Does wearing 2 hours less matter?", "2時間少ないと影響しますか？", "2시간 덜 착용하면 영향이 있나요?", "¿Afecta usar 2 horas menos?", "2 heures de moins ont-elles un impact ?", "Sind 2 Stunden weniger relevant?"),
+            "少戴会影响矫正效果，建议尽量补足医嘱时长" to listOf("Wearing less can affect correction; try to make up the prescribed time", "装着不足は矯正効果に影響するため、指示時間を補ってください", "착용 부족은 교정 효과에 영향을 줄 수 있어 처방 시간을 보완하세요", "Usar menos puede afectar la corrección; intenta completar el tiempo prescrito", "Un port insuffisant peut affecter la correction ; complétez le temps prescrit", "Weniger Tragen kann die Korrektur beeinflussen; verordnete Zeit möglichst ausgleichen"),
+            "当前最直接的改进点是先补足近7天平均与医嘱之间约" to listOf("The most direct improvement is to close the gap of about ", "最も直接的な改善点は、直近7日平均と指示時間の差約", "가장 직접적인 개선점은 최근 7일 평균과 처방 간 약 ", "La mejora directa es cubrir una brecha de aprox. ", "L'amélioration directe est de combler environ ", "Direkteste Verbesserung ist, die Lücke von ca. "),
+            "的缺口" to listOf(" gap", "の不足", "의 부족분", " de brecha", " de manque", " Lücke"),
+            "包括" to listOf("include", "を含む", "포함", "incluyen", "incluent", "umfassen"),
+            "建议咨询时同步说明" to listOf("mention this during consultation", "相談時に併せて説明してください", "상담 시 함께 설명하세요", "menciónalo en la consulta", "à signaler pendant la consultation", "bei Beratung erwähnen"),
+            "下午14点设一次佩戴提醒" to listOf("Set a wearing reminder at 14:00", "14時に装着リマインダーを設定", "14시에 착용 알림 설정", "Pon un recordatorio a las 14:00", "Programmer un rappel à 14:00", "Trageerinnerung um 14:00 einstellen"),
+            "放学后先穿戴再写作业" to listOf("Wear the brace before homework after school", "放課後は宿題前に装着", "하교 후 숙제 전에 착용", "Después de clase, ponerse el corsé antes de deberes", "Après l'école, mettre l'orthèse avant les devoirs", "Nach der Schule vor Hausaufgaben anlegen"),
+            "睡前检查支具是否压迫皮肤" to listOf("Check for skin pressure before sleep", "就寝前に皮膚圧迫を確認", "자기 전 피부 압박 확인", "Revisar presión en la piel antes de dormir", "Vérifier la pression cutanée avant le coucher", "Vor dem Schlafen Hautdruck prüfen"),
+            "拍照" to listOf("Take Photo", "撮影", "촬영", "Hacer foto", "Prendre photo", "Foto aufnehmen"),
+            "查看" to listOf("View", "表示", "보기", "Ver", "Voir", "Ansehen"),
+            "成就" to listOf("Achievement", "達成", "성취", "Logro", "Réussite", "Erfolg"),
+            "青少年向成就视图" to listOf("Teen achievement view", "青少年向け達成ビュー", "청소년용 성취 보기", "Vista de logros para adolescentes", "Vue de réussite ado", "Erfolgsansicht für Jugendliche"),
+            "今日佩戴进度、连续达标天数和阶段徽章会以青少年视角呈现。" to listOf("Today's wearing progress, compliance streak, and badges are shown for teens.", "今日の装着進捗、連続達成日数、バッジを青少年向けに表示します。", "오늘 착용 진행률, 연속 달성일, 배지를 청소년 시각으로 표시합니다.", "El progreso de hoy, la racha y las insignias se muestran para adolescentes.", "Le progrès du jour, la série et les badges sont présentés pour adolescents.", "Heutiger Fortschritt, Serien und Abzeichen werden jugendgerecht angezeigt."),
+            "2条未读预警" to listOf("2 unread alerts", "未読アラート2件", "읽지 않은 알림 2개", "2 alertas sin leer", "2 alertes non lues", "2 ungelesene Warnungen"),
+            "AI 周报月报与复诊材料" to listOf("AI weekly/monthly reports and visit materials", "AI週報・月報と再診資料", "AI 주간/월간 보고서 및 재진 자료", "Informes IA semanales/mensuales y revisión", "Rapports IA hebdo/mensuels et suivi", "KI-Wochen-/Monatsberichte und Kontrollmaterial"),
+            "周报" to listOf("Weekly Report", "週報", "주간 보고서", "Informe semanal", "Rapport hebdomadaire", "Wochenbericht"),
+            "月报" to listOf("Monthly Report", "月報", "월간 보고서", "Informe mensual", "Rapport mensuel", "Monatsbericht"),
+            "30天报告" to listOf("30-day Report", "30日レポート", "30일 보고서", "Informe de 30 días", "Rapport 30 jours", "30-Tage-Bericht"),
+            "30天" to listOf("30 days", "30日", "30일", "30 días", "30 jours", "30 Tage"),
+            "1条" to listOf("1 item", "1件", "1개", "1 registro", "1 élément", "1 Eintrag"),
+            "2条" to listOf("2 items", "2件", "2개", "2 registros", "2 éléments", "2 Einträge"),
+            "3条" to listOf("3 items", "3件", "3개", "3 registros", "3 éléments", "3 Einträge"),
+            "异常报告" to listOf("Abnormality Report", "異常レポート", "이상 보고서", "Informe de anomalías", "Rapport d'anomalie", "Auffälligkeitsbericht"),
+            "缺口" to listOf("Gaps", "不足", "부족", "Déficits", "Manques", "Lücken"),
+            "平均" to listOf("Avg", "平均", "평균", "Media", "Moy.", "Schnitt"),
+            "近期佩戴有改善" to listOf("recent wearing has improved", "最近の装着は改善しています", "최근 착용이 개선되었습니다", "el uso reciente ha mejorado", "le port récent s'améliore", "das jüngste Tragen hat sich verbessert"),
+            "皮肤问题" to listOf("Skin Problems", "皮膚問題", "피부 문제", "Problemas de piel", "Problèmes cutanés", "Hautprobleme"),
+            "皮肤、生长与影像档案" to listOf("Skin, Growth and Imaging Archive", "皮膚・成長・画像アーカイブ", "피부, 성장 및 영상 기록", "Piel, crecimiento e imágenes", "Peau, croissance et imagerie", "Haut, Wachstum und Bildarchiv"),
+            "不要求每天检查；仅在发现皮肤问题时拍照并填写记录，内容会进入复诊报告。" to listOf("Daily check-in is not required. Take a photo and record only when a skin problem is found; the content will be included in the visit report.", "毎日の確認は不要です。皮膚問題を見つけた時だけ撮影して記録し、再診レポートに反映されます。", "매일 확인할 필요는 없습니다. 피부 문제가 발견될 때만 사진과 기록을 남기며 재진 보고서에 포함됩니다.", "No requiere registro diario. Solo toma una foto y registra cuando encuentres un problema de piel; se integrará en el informe.", "Le contrôle quotidien n'est pas requis. Photographiez et notez seulement en cas de problème cutané; ce sera intégré au rapport.", "Tägliche Kontrolle ist nicht erforderlich. Nur bei Hautproblemen Foto und Eintrag erfassen; dies wird im Kontrollbericht berücksichtigt."),
+            "近30天佩戴" to listOf("Last 30 Days", "直近30日", "최근 30일", "Últimos 30 días", "30 derniers jours", "Letzte 30 Tage"),
+            "近7天佩戴" to listOf("Last 7 Days", "直近7日", "최근 7일", "Últimos 7 días", "7 derniers jours", "Letzte 7 Tage"),
+            "智能解读" to listOf("Smart Insights", "スマート解釈", "지능형 해석", "Interpretación inteligente", "Analyse intelligente", "Intelligente Auswertung"),
+            "历史趋势" to listOf("History Trend", "履歴トレンド", "기록 추세", "Tendencia histórica", "Tendance historique", "Historischer Trend"),
+            "历史记录" to listOf("History", "履歴", "기록", "Historial", "Historique", "Verlauf"),
+            "佩戴统计" to listOf("Wearing Statistics", "装着統計", "착용 통계", "Estadísticas de uso", "Statistiques de port", "Tragestatistik"),
+            "目标完成" to listOf("Target Completion", "目標達成", "목표 달성", "Cumplimiento del objetivo", "Objectif atteint", "Zielerfüllung"),
+            "最长连续达标" to listOf("Longest Streak", "最長連続達成", "최장 연속 달성", "Racha más larga", "Plus longue série", "Längste Serie"),
+            "近30天有数据" to listOf("30-day Data", "30日データ", "30일 데이터", "Datos de 30 días", "Données 30 jours", "30-Tage-Daten"),
+            "有数据" to listOf("Data Days", "データあり", "데이터 있음", "Días con datos", "Jours avec données", "Datentage"),
+            "正在读取云端数据" to listOf("Reading cloud data", "クラウドデータ読み取り中", "클라우드 데이터 읽는 중", "Leyendo datos de la nube", "Lecture des données cloud", "Cloud-Daten werden gelesen"),
+            "暂无云端数据" to listOf("No cloud data", "クラウドデータなし", "클라우드 데이터 없음", "Sin datos en la nube", "Aucune donnée cloud", "Keine Cloud-Daten"),
+            "云端数据" to listOf("Cloud Data", "クラウドデータ", "클라우드 데이터", "Datos en la nube", "Données cloud", "Cloud-Daten"),
+            "问题拍照" to listOf("Problem Photo", "問題写真", "문제 사진", "Foto del problema", "Photo du problème", "Problemfoto"),
+            "身高趋势" to listOf("Height Trend", "身長トレンド", "키 추세", "Tendencia de altura", "Tendance de taille", "Größentrend"),
+            "影像上传" to listOf("Image Upload", "画像アップロード", "영상 업로드", "Subir imagen", "Envoi d'image", "Bild hochladen"),
+            "智能咨询" to listOf("AI Consult", "AI相談", "AI 상담", "Consulta IA", "Conseil IA", "KI-Beratung"),
+            "复诊材料" to listOf("Visit Materials", "再診資料", "재진 자료", "Material de revisión", "Documents de suivi", "Kontrollmaterial"),
+            "35天日均" to listOf("35-day Avg", "35日平均", "35일 평균", "Media 35 días", "Moyenne 35 jours", "35-Tage-Schnitt"),
+            "总体达标率" to listOf("Overall Compliance", "総合達成率", "전체 달성률", "Cumplimiento total", "Observance globale", "Gesamterfüllung"),
+            "最长连续" to listOf("Longest Streak", "最長連続", "최장 연속", "Racha más larga", "Plus longue série", "Längste Serie"),
+            "达标率" to listOf("Compliance", "達成率", "달성률", "Cumplimiento", "Observance", "Erfüllung"),
+            "达标标准" to listOf("Target standard", "達成基準", "달성 기준", "Estándar objetivo", "Seuil cible", "Zielstandard"),
+            "达标" to listOf("Met", "達成", "달성", "Cumple", "Atteint", "Erfüllt"),
+            "h/天" to listOf("h/day", "h/日", "h/일", "h/día", "h/jour", "h/Tag"),
+            "条记录" to listOf(" records", "件の記録", "개 기록", " registros", " dossiers", " Einträge"),
+            "张" to listOf(" photos", "枚", "장", " fotos", " photos", " Fotos"),
+            "照片" to listOf("Photo", "写真", "사진", "Foto", "Photo", "Foto"),
+            "未填写备注" to listOf("No note entered", "メモ未入力", "메모 없음", "Sin nota", "Aucune note", "Keine Notiz"),
+            "未填写" to listOf("Not filled", "未入力", "미입력", "Sin completar", "Non renseigné", "Nicht ausgefüllt"),
+            "已保存" to listOf("Saved", "保存済み", "저장됨", "Guardado", "Enregistré", "Gespeichert"),
+            "保存后将在这里显示" to listOf("Saved records will appear here", "保存後ここに表示されます", "저장 후 여기에 표시됩니다", "Los registros guardados aparecerán aquí", "Les éléments enregistrés apparaîtront ici", "Gespeicherte Einträge erscheinen hier"),
+            "录入后将在这里显示" to listOf("Entries will appear here", "入力後ここに表示されます", "입력 후 여기에 표시됩니다", "Las entradas aparecerán aquí", "Les saisies apparaîtront ici", "Einträge erscheinen hier"),
+            "正在读取皮肤记录" to listOf("Reading skin records", "皮膚記録を読み取り中", "피부 기록 읽는 중", "Leyendo registros de piel", "Lecture des dossiers de peau", "Hautprotokolle werden gelesen"),
+            "正在读取生长记录" to listOf("Reading growth records", "成長記録を読み取り中", "성장 기록 읽는 중", "Leyendo crecimiento", "Lecture des données de croissance", "Wachstumsdaten werden gelesen"),
+            "正在读取影像档案" to listOf("Reading imaging archive", "画像記録を読み取り中", "영상 기록 읽는 중", "Leyendo archivo de imágenes", "Lecture du dossier d'imagerie", "Bildarchiv wird gelesen"),
+            "皮肤问题记录" to listOf("Skin Problem Record", "皮膚問題記録", "피부 문제 기록", "Registro de problema de piel", "Dossier de problème cutané", "Hautproblem-Protokoll"),
+            "发现发红、疼痛、破皮等问题时记录" to listOf("Record redness, pain, skin breakage, or similar issues", "発赤、痛み、皮膚損傷などを記録", "발적, 통증, 피부 손상 등을 기록", "Registra enrojecimiento, dolor o heridas", "Enregistrer rougeur, douleur ou plaie", "Rötung, Schmerz oder Hautschaden erfassen"),
+            "问题部位" to listOf("Problem Area", "問題部位", "문제 부위", "Zona del problema", "Zone du problème", "Problembereich"),
+            "问题类型" to listOf("Problem Type", "問題タイプ", "문제 유형", "Tipo de problema", "Type de problème", "Problemtyp"),
+            "备注" to listOf("Note", "メモ", "메모", "Nota", "Note", "Notiz"),
+            "照片编号/说明" to listOf("Photo ID/Description", "写真番号/説明", "사진 번호/설명", "ID/descr. de foto", "ID/description photo", "Foto-ID/Beschreibung"),
+            "历史皮肤问题" to listOf("Skin Problem History", "皮膚問題履歴", "피부 문제 기록", "Historial de piel", "Historique cutané", "Hautproblem-Verlauf"),
+            "记录时间" to listOf("Record Time", "記録時刻", "기록 시간", "Hora de registro", "Heure d'enregistrement", "Erfassungszeit"),
+            "文字记录" to listOf("Text Note", "文字記録", "텍스트 기록", "Nota escrita", "Note texte", "Textnotiz"),
+            "身高(cm)" to listOf("Height (cm)", "身長(cm)", "키(cm)", "Altura (cm)", "Taille (cm)", "Größe (cm)"),
+            "上一次录入" to listOf("Previous entry", "前回入力", "이전 입력", "Registro anterior", "Saisie précédente", "Vorheriger Eintrag"),
+            "暂无上一次身高录入记录" to listOf("No previous height entry", "前回の身長記録なし", "이전 키 기록 없음", "Sin altura previa", "Aucune taille précédente", "Keine vorherige Größe"),
+            "历史生长记录" to listOf("Growth History", "成長履歴", "성장 기록", "Historial de crecimiento", "Historique de croissance", "Wachstumsverlauf"),
+            "影像录入" to listOf("Imaging Entry", "画像入力", "영상 입력", "Entrada de imagen", "Saisie d'imagerie", "Bilderfassung"),
+            "影像类型" to listOf("Imaging Type", "画像タイプ", "영상 유형", "Tipo de imagen", "Type d'imagerie", "Bildtyp"),
+            "拍摄日期" to listOf("Shot Date", "撮影日", "촬영일", "Fecha de captura", "Date de prise", "Aufnahmedatum"),
+            "文件地址/编号" to listOf("File URL/ID", "ファイルURL/番号", "파일 주소/번호", "URL/ID de archivo", "URL/ID du fichier", "Datei-URL/ID"),
+            "从图库选择" to listOf("Choose from Gallery", "ギャラリーから選択", "갤러리에서 선택", "Elegir de galería", "Choisir dans la galerie", "Aus Galerie wählen"),
+            "保存影像记录" to listOf("Save Imaging Record", "画像記録を保存", "영상 기록 저장", "Guardar imagen", "Enregistrer l'imagerie", "Bildaufzeichnung speichern"),
+            "影像预览" to listOf("Image Preview", "画像プレビュー", "영상 미리보기", "Vista previa", "Aperçu d'image", "Bildvorschau"),
+            "档案、设备与隐私" to listOf("Profile, Device and Privacy", "プロフィール、機器、プライバシー", "프로필, 장치 및 개인정보", "Perfil, dispositivo y privacidad", "Dossier, appareil et confidentialité", "Profil, Gerät und Datenschutz"),
+            "消息中心" to listOf("Messages", "メッセージ", "메시지", "Mensajes", "Messages", "Nachrichten"),
+            "孩子模式" to listOf("Child Mode", "子どもモード", "아이 모드", "Modo infantil", "Mode enfant", "Kindermodus"),
+            "进入孩子模式" to listOf("Enter Child Mode", "子どもモードへ", "아이 모드로 이동", "Entrar en modo infantil", "Entrer en mode enfant", "Kindermodus öffnen"),
+            "退出登录" to listOf("Log Out", "ログアウト", "로그아웃", "Cerrar sesión", "Déconnexion", "Abmelden"),
+            "当前" to listOf("Current", "現在", "현재", "Actual", "Actuel", "Aktuell"),
+            "已关联档案" to listOf("profile linked", "プロフィール連携済み", "프로필 연결됨", "perfil vinculado", "dossier lié", "Profil verknüpft"),
+            "个性化" to listOf("Personalized", "個別化", "개인화", "Personalizado", "Personnalisé", "Personalisiert"),
+            "少戴2h有影响吗" to listOf("Does 2h less matter?", "2時間少ないと影響しますか", "2시간 덜 착용하면 영향이 있나요?", "¿Afecta usar 2 h menos?", "2 h de moins ont-elles un impact ?", "Sind 2 h weniger relevant?"),
+            "皮肤红了怎么办" to listOf("What if skin is red?", "皮膚が赤い時は？", "피부가 빨개지면?", "¿Qué hago si la piel se enrojece?", "Que faire si la peau rougit ?", "Was tun bei Rötung?"),
+            "能上体育课吗" to listOf("Can attend PE?", "体育に参加できますか", "체육 수업 가능?", "¿Puede hacer educación física?", "Peut-il faire sport ?", "Darf Sport gemacht werden?"),
+            "被同学笑话怎么办" to listOf("What if classmates tease?", "同級生にからかわれたら？", "친구들이 놀리면?", "¿Si se burlan en clase?", "Que faire en cas de moqueries ?", "Was bei Hänseleien?"),
+            "依从性报告" to listOf("Compliance Report", "遵守状況レポート", "순응도 보고서", "Informe de cumplimiento", "Rapport d'observance", "Compliance-Bericht"),
+            "基于云端真实数据自动生成" to listOf("Generated from real cloud data", "クラウド実データから自動生成", "실제 클라우드 데이터 기반 자동 생성", "Generado con datos reales de la nube", "Généré à partir des données cloud réelles", "Aus echten Cloud-Daten erzeugt"),
+            "本周摘要" to listOf("Weekly Summary", "今週の要約", "이번 주 요약", "Resumen semanal", "Résumé hebdomadaire", "Wochenübersicht"),
+            "复诊报告预览" to listOf("Visit Report Preview", "再診レポートプレビュー", "재진 보고서 미리보기", "Vista previa del informe", "Aperçu du rapport de suivi", "Kontrollbericht-Vorschau"),
+            "周期" to listOf("Period", "期間", "기간", "Periodo", "Période", "Zeitraum"),
+            "归档逻辑" to listOf("Archive Logic", "アーカイブロジック", "보관 로직", "Lógica de archivo", "Logique d'archive", "Archivlogik"),
+            "归档列表" to listOf("Archive List", "アーカイブ一覧", "보관 목록", "Lista de archivo", "Liste des archives", "Archivliste"),
+            "报告类型" to listOf("Report Type", "レポート種別", "보고서 유형", "Tipo de informe", "Type de rapport", "Berichtstyp"),
+            "统计周期" to listOf("Statistics Period", "統計期間", "통계 기간", "Periodo estadístico", "Période statistique", "Statistikzeitraum"),
+            "生成时间" to listOf("Generated Time", "生成時刻", "생성 시간", "Hora de generación", "Heure de génération", "Erstellzeit"),
+            "报告摘要" to listOf("Report Summary", "レポート要約", "보고서 요약", "Resumen del informe", "Résumé du rapport", "Berichtszusammenfassung"),
+            "云端已读取" to listOf("Cloud loaded ", "クラウド読み取り済み ", "클라우드에서 읽음 ", "Nube cargada ", "Cloud chargé ", "Cloud geladen "),
+            "天佩戴记录" to listOf(" days of wearing records", "日の装着記録", "일 착용 기록", " días de uso", " jours de port", " Tage Tragedaten"),
+            "近30天平均" to listOf("30-day average ", "30日平均 ", "30일 평균 ", "Media 30 días ", "Moyenne 30 jours ", "30-Tage-Schnitt "),
+            "近30天达标率良好" to listOf("30-day compliance is good", "30日達成率は良好", "30일 달성률이 양호함", "El cumplimiento de 30 días es bueno", "L'observance sur 30 jours est bonne", "30-Tage-Erfüllung ist gut"),
+            "近30天达标率一般" to listOf("30-day compliance is fair", "30日達成率は普通", "30일 달성률이 보통임", "El cumplimiento de 30 días es medio", "L'observance sur 30 jours est moyenne", "30-Tage-Erfüllung ist mittel"),
+            "近30天达标率偏低" to listOf("30-day compliance is low", "30日達成率は低め", "30일 달성률이 낮음", "El cumplimiento de 30 días es bajo", "L'observance sur 30 jours est faible", "30-Tage-Erfüllung ist niedrig"),
+            "建议继续保持当前佩戴节奏" to listOf("please keep the current wearing routine", "現在の装着リズムを維持してください", "현재 착용 리듬을 유지하세요", "mantén el ritmo actual de uso", "gardez le rythme actuel de port", "bitte aktuellen Tragerhythmus beibehalten"),
+            "建议优先补足固定缺口时段" to listOf("prioritize filling fixed gap periods", "固定の不足時間を優先して補ってください", "고정된 부족 시간대를 먼저 보완하세요", "prioriza cubrir las franjas con déficit fijo", "priorisez les créneaux de manque fixes", "feste Lückenzeiten zuerst ausgleichen"),
+            "建议尽快与" to listOf("please contact ", "早めに", "가능하면 빨리 ", "contacta pronto con ", "contactez rapidement ", "bitte zeitnah "),
+            "沟通佩戴困难" to listOf("about wearing difficulties", "に装着の困難を相談してください", "에게 착용 어려움을 상담하세요", "sobre las dificultades de uso", "au sujet des difficultés de port", "zu Trageschwierigkeiten kontaktieren"),
+            "近7天平均" to listOf("7-day average ", "7日平均 ", "7일 평균 ", "Media 7 días ", "Moyenne 7 jours ", "7-Tage-Schnitt "),
+            "较前7天增加" to listOf("increased vs previous 7 days by ", "前7日より増加 ", "이전 7일보다 증가 ", "aumentó frente a los 7 días previos ", "en hausse vs 7 jours précédents ", "mehr als vorige 7 Tage um "),
+            "较前7天下降" to listOf("decreased vs previous 7 days by ", "前7日より低下 ", "이전 7일보다 감소 ", "bajó frente a los 7 días previos ", "en baisse vs 7 jours précédents ", "weniger als vorige 7 Tage um "),
+            "近期佩戴有所改善" to listOf("recent wearing has improved", "最近の装着は改善しています", "최근 착용이 개선되었습니다", "el uso reciente ha mejorado", "le port récent s'améliore", "das jüngste Tragen hat sich verbessert"),
+            "需要关注近期佩戴下降" to listOf("watch the recent wearing decline", "最近の装着低下に注意してください", "최근 착용 감소를 확인하세요", "vigila la disminución reciente", "surveillez la baisse récente du port", "den jüngsten Rückgang beachten"),
+            "较前7天变化小于1h" to listOf("change vs previous 7 days is under 1h", "前7日比の変化は1時間未満", "이전 7일 대비 변화가 1시간 미만", "cambio menor de 1 h frente a 7 días previos", "variation inférieure à 1 h vs 7 jours précédents", "Änderung unter 1 h gegenüber Vorwoche"),
+            "近期较稳定" to listOf("recently stable", "最近は安定", "최근 안정적", "recientemente estable", "récemment stable", "zuletzt stabil"),
+            "出现连续" to listOf("There are ", "連続", "연속 ", "Hay ", "Il y a ", "Es gibt "),
+            "天严重不足" to listOf(" days of severe shortage", "日の深刻な不足", "일 심각한 부족", " días de déficit grave", " jours de déficit sévère", " Tage starke Untererfüllung"),
+            "低于医嘱" to listOf("below prescription", "医師指示未満", "처방 미만", "por debajo de la prescripción", "sous la prescription", "unter Verordnung"),
+            "阈值" to listOf("threshold", "しきい値", "임계값", "umbral", "seuil", "Schwelle"),
+            "建议纳入复诊沟通" to listOf("include this in the follow-up discussion", "再診時の相談に含めてください", "재진 상담에 포함하세요", "inclúyelo en la revisión", "à inclure dans le suivi", "in der Kontrolle besprechen"),
+            "小时明细显示主要缺口集中在" to listOf("Hourly details show main gaps at ", "時間別明細では主な不足は", "시간별 상세에서 주요 부족 시간은 ", "El detalle horario muestra déficits en ", "Le détail horaire montre les manques à ", "Stundendetails zeigen Hauptlücken um "),
+            "本周主要缺口集中在" to listOf("This week's main gaps are at ", "今週の主な不足は", "이번 주 주요 부족 시간은 ", "Los principales déficits de la semana están en ", "Les principaux manques de la semaine sont à ", "Diese Woche liegen die Hauptlücken um "),
+            "近期皮肤问题记录" to listOf("Recent skin problem records", "最近の皮膚問題記録", "최근 피부 문제 기록", "Registros recientes de piel", "Problèmes cutanés récents", "Aktuelle Hautprobleme"),
+            "近期皮肤记录" to listOf("Recent skin records", "最近の皮膚記録", "최근 피부 기록", "Registros recientes de piel", "Dossiers cutanés récents", "Aktuelle Hautprotokolle"),
+            "已纳入复诊报告素材" to listOf("included in visit report materials", "再診レポート資料に含まれます", "재진 보고서 자료에 포함됨", "incluido en el informe de revisión", "intégré au rapport de suivi", "im Kontrollbericht berücksichtigt"),
+            "已纳入复诊关注" to listOf("included in follow-up focus", "再診時の確認事項に含まれます", "재진 관심 항목에 포함됨", "incluido en el seguimiento", "intégré aux points de suivi", "in Kontrollfokus aufgenommen"),
+            "近1个月身高增加" to listOf("Height increased in the last month by ", "直近1か月の身長増加 ", "최근 1개월 키 증가 ", "La altura aumentó en el último mes ", "La taille a augmenté sur 1 mois de ", "Größenzunahme im letzten Monat "),
+            "超过1.3cm" to listOf("over 1.3 cm", "1.3cm超", "1.3cm 초과", "más de 1,3 cm", "plus de 1,3 cm", "über 1,3 cm"),
+            "复诊时建议评估支具适配" to listOf("evaluate brace fit at follow-up", "再診時に装具適合を評価してください", "재진 시 보조기 적합성을 평가하세요", "evalúa el ajuste del corsé en revisión", "évaluer l'adaptation de l'orthèse au suivi", "Orthesenpassform bei Kontrolle prüfen"),
+            "最近影像记录为" to listOf("Latest imaging record is ", "最新画像記録は", "최근 영상 기록은 ", "El último registro de imagen es ", "Le dernier dossier d'imagerie est ", "Letzte Bildaufzeichnung ist "),
+            "可作为复诊材料补充" to listOf("can supplement visit materials", "再診資料の補足になります", "재진 자료로 보완 가능", "puede complementar el material de revisión", "peut compléter le dossier de suivi", "kann Kontrollmaterial ergänzen"),
+            "男" to listOf("Male", "男", "남", "Masculino", "Masculin", "Männlich"),
+            "女" to listOf("Female", "女", "여", "Femenino", "Féminin", "Weiblich"),
+            "胸腰弯" to listOf("Thoracolumbar curve", "胸腰椎カーブ", "흉요추 만곡", "Curva toracolumbar", "Courbure thoraco-lombaire", "Thorakolumbale Krümmung"),
+            "胸弯" to listOf("Thoracic curve", "胸椎カーブ", "흉추 만곡", "Curva torácica", "Courbure thoracique", "Thorakale Krümmung"),
+            "腰弯" to listOf("Lumbar curve", "腰椎カーブ", "요추 만곡", "Curva lumbar", "Courbure lombaire", "Lumbale Krümmung"),
+            "硬支具" to listOf("Rigid brace", "硬性装具", "경성 보조기", "Corsé rígido", "Orthèse rigide", "Starre Orthese"),
+            "软支具" to listOf("Soft brace", "軟性装具", "연성 보조기", "Corsé blando", "Orthèse souple", "Weiche Orthese"),
+            "左腰部" to listOf("Left waist", "左腰部", "왼쪽 허리", "Cintura izquierda", "Taille gauche", "Linke Taille"),
+            "右腰部" to listOf("Right waist", "右腰部", "오른쪽 허리", "Cintura derecha", "Taille droite", "Rechte Taille"),
+            "背部" to listOf("Back", "背部", "등", "Espalda", "Dos", "Rücken"),
+            "胸腹部" to listOf("Chest/abdomen", "胸腹部", "흉복부", "Pecho/abdomen", "Thorax/abdomen", "Brust/Bauch"),
+            "肩部" to listOf("Shoulder", "肩", "어깨", "Hombro", "Épaule", "Schulter"),
+            "骨盆/髋部" to listOf("Pelvis/hip", "骨盤/股関節", "골반/고관절", "Pelvis/cadera", "Bassin/hanche", "Becken/Hüfte"),
+            "其他" to listOf("Other", "その他", "기타", "Otro", "Autre", "Andere"),
+            "发红" to listOf("Redness", "発赤", "발적", "Enrojecimiento", "Rougeur", "Rötung"),
+            "瘙痒" to listOf("Itching", "かゆみ", "가려움", "Picor", "Démangeaison", "Juckreiz"),
+            "疼痛" to listOf("Pain", "痛み", "통증", "Dolor", "Douleur", "Schmerz"),
+            "破皮" to listOf("Skin break", "皮膚損傷", "피부 손상", "Herida", "Plaie", "Hautverletzung"),
+            "水泡" to listOf("Blister", "水疱", "물집", "Ampolla", "Ampoule", "Blase"),
+            "无异常" to listOf("No abnormality", "異常なし", "이상 없음", "Sin anomalías", "Aucune anomalie", "Keine Auffälligkeit"),
+            "X光" to listOf("X-ray", "X線", "X-ray", "Radiografía", "Radiographie", "Röntgen"),
+            "站立体态照" to listOf("Standing posture photo", "立位姿勢写真", "서있는 자세 사진", "Foto de postura de pie", "Photo de posture debout", "Standhaltungsfoto"),
+            "Adams前屈照" to listOf("Adams forward bend photo", "Adams前屈写真", "Adams 전굴 사진", "Foto de flexión Adams", "Photo de flexion Adams", "Adams-Vorbeugetest-Foto"),
             "快速开始" to listOf("Quick Start", "クイックスタート", "빠른 시작", "Inicio rápido", "Démarrage rapide", "Schnellstart"),
             "蓝牙设备绑定" to listOf("Bluetooth Device Binding", "Bluetoothデバイスのバインド", "블루투스 기기 바인딩", "Vinculación Bluetooth", "Association Bluetooth", "Bluetooth-Gerät koppeln"),
             "读取佩戴数据" to listOf("Read Wearing Data", "装着データの読み取り", "착용 데이터 읽기", "Leer datos de uso", "Lire les données de port", "Tragedaten lesen"),

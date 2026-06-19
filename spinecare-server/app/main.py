@@ -274,6 +274,32 @@ def iso_row(row: dict) -> dict:
     return result
 
 
+def iso_wear_row(row: dict) -> dict:
+    result = iso_row(row)
+    intervals = result.get("intervals_json")
+    record_date_text = result.get("record_date")
+    if isinstance(intervals, dict) and isinstance(record_date_text, str):
+        try:
+            record_date_value = date.fromisoformat(record_date_text)
+        except ValueError:
+            record_date_value = None
+        if record_date_value:
+            hourly_records = [
+                record
+                for record in (normalized_hour_record(record, record_date_value) for record in intervals.get("hourly_records") or [])
+                if record
+            ]
+            if hourly_records:
+                intervals["hourly_records"] = hourly_records
+                intervals["sample_count"] = sum(int(record.get("sample_count", 0)) for record in hourly_records)
+                intervals["worn_count"] = sum(int(record.get("worn_count", 0)) for record in hourly_records)
+                result["worn_hours"] = round(min(24.0, sum(float(record.get("worn_hours", 0.0)) for record in hourly_records)), 1)
+                prescribed = float(result.get("prescribed_hours") or 0)
+                if prescribed > 0:
+                    result["is_compliant"] = int(float(result["worn_hours"]) >= prescribed)
+    return result
+
+
 def range_days(range_name: str) -> int:
     mapping = {
         "week": 7,
@@ -355,6 +381,129 @@ def prescribed_hours_for_child(child_id: str) -> float:
         if 0 < value <= 24:
             return value
     return 20.0
+
+
+def json_value(value):
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def ten_minute_sample_slot(raw_time: str) -> str | None:
+    value = raw_time.replace("T", " ").strip()
+    if len(value) < 16:
+        return None
+    try:
+        parsed = datetime.strptime(value[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    parsed = parsed.replace(minute=(parsed.minute // 10) * 10, second=0, microsecond=0)
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def normalized_hour_record(record: dict, record_date: date) -> dict | None:
+    hour_text = str(record.get("hour_start", "")).strip()
+    if len(hour_text) >= 13 and hour_text[4] == "-":
+        hour_start = hour_text.replace("T", " ")[:13] + ":00"
+    else:
+        hour_value = record.get("hour_index", str(hour_text).split(":", 1)[0])
+        try:
+            hour = max(0, min(23, int(hour_value)))
+        except (TypeError, ValueError):
+            return None
+        hour_start = f"{record_date.isoformat()} {hour:02d}:00"
+    try:
+        worn_hours = round(max(0.0, min(1.0, float(record.get("worn_hours", 0.0)))), 1)
+    except (TypeError, ValueError):
+        worn_hours = 0.0
+    samples_by_time: dict[str, dict] = {}
+    for sample in record.get("samples") or []:
+        if not isinstance(sample, dict):
+            continue
+        raw_time = str(sample.get("recorded_at", "")).replace("T", " ").strip()
+        if len(raw_time) < 16:
+            continue
+        sample_time = ten_minute_sample_slot(raw_time)
+        if not sample_time:
+            continue
+        if sample_time[:13] + ":00" != hour_start:
+            continue
+        previous = samples_by_time.get(sample_time)
+        worn = bool(sample.get("worn", False))
+        samples_by_time[sample_time] = {
+            "recorded_at": sample_time,
+            "worn": (previous["worn"] if previous else worn) and worn,
+        }
+    if samples_by_time:
+        samples = [samples_by_time[key] for key in sorted(samples_by_time)]
+        sample_count = min(6, len(samples))
+        worn_count = min(6, sum(1 for sample in samples if sample["worn"]))
+        worn_hours = round(worn_count / 6.0, 1)
+    else:
+        samples = []
+        try:
+            sample_count = max(0, min(6, int(record.get("sample_count", 6))))
+        except (TypeError, ValueError):
+            sample_count = 6
+        try:
+            worn_count = max(0, min(6, int(record.get("worn_count", round(worn_hours * 6)))))
+        except (TypeError, ValueError):
+            worn_count = round(worn_hours * 6)
+    return {
+        "hour_start": hour_start,
+        "worn_hours": worn_hours,
+        "sample_count": sample_count,
+        "worn_count": worn_count,
+        "samples": samples,
+    }
+
+
+def merge_hour_record(existing: dict | None, incoming: dict) -> dict:
+    if not existing:
+        return incoming
+    existing_samples = {sample["recorded_at"]: sample for sample in existing.get("samples") or []}
+    incoming_samples = {sample["recorded_at"]: sample for sample in incoming.get("samples") or []}
+    if existing_samples or incoming_samples:
+        merged_samples = dict(existing_samples)
+        for recorded_at, sample in incoming_samples.items():
+            if recorded_at in merged_samples:
+                merged_samples[recorded_at] = {
+                    "recorded_at": recorded_at,
+                    "worn": bool(merged_samples[recorded_at].get("worn", False)) and bool(sample.get("worn", False)),
+                }
+            else:
+                merged_samples[recorded_at] = sample
+        if merged_samples:
+            samples = [merged_samples[key] for key in sorted(merged_samples)]
+            sample_count = min(6, len(samples))
+            worn_count = min(6, sum(1 for sample in samples if sample["worn"]))
+            return {
+                "hour_start": incoming["hour_start"],
+                "worn_hours": round(worn_count / 6.0, 1),
+                "sample_count": sample_count,
+                "worn_count": worn_count,
+                "samples": samples,
+            }
+    if int(incoming.get("sample_count", 6)) < int(existing.get("sample_count", 6)):
+        return existing
+    return incoming
+
+
+def merged_hourly_records(existing_intervals, incoming_records: list[dict], record_date: date) -> list[dict]:
+    by_hour: dict[str, dict] = {}
+    existing = json_value(existing_intervals)
+    for record in existing.get("hourly_records") or []:
+        normalized = normalized_hour_record(record, record_date)
+        if normalized:
+            by_hour[normalized["hour_start"]] = normalized
+    for record in incoming_records:
+        normalized = normalized_hour_record(record, record_date)
+        if normalized:
+            by_hour[normalized["hour_start"]] = merge_hour_record(by_hour.get(normalized["hour_start"]), normalized)
+    return [by_hour[key] for key in sorted(by_hour)]
 
 
 @app.get("/")
@@ -506,7 +655,7 @@ def wear_summary(child_id: str = "demo-child", range: str = "week"):
 @app.get("/api/v1/wear/records")
 def wear_records(child_id: str = "demo-child", days: int = 35):
     rows = query_wear_rows(child_id, max(1, min(days, 3650)))
-    return {"items": [iso_row(row) for row in rows]}
+    return {"items": [iso_wear_row(row) for row in rows]}
 
 
 @app.post("/api/v1/wear/device-sync")
@@ -517,22 +666,36 @@ def sync_device_wear(payload: DeviceWearSyncRequest):
             "saved": 0,
             "message": "no records",
         }
-    if (
-        payload.raw.get("worn_bits") == 0
-        and all(float(item.worn_hours) == 0.0 and item.worn_count == 0 for item in payload.records)
-    ):
-        return {
-            "ok": True,
-            "saved": 0,
-            "skipped": len(payload.records),
-            "message": "cleared device history ignored",
-        }
-
     prescribed_hours = prescribed_hours_for_child(payload.child_id)
     saved_dates: list[str] = []
     with db_cursor(commit=True) as cur:
         for item in payload.records:
-            worn_hours = round(float(item.worn_hours), 1)
+            cur.execute(
+                """
+                SELECT intervals_json
+                FROM wear_records
+                WHERE child_id = %s AND record_date = %s
+                FOR UPDATE
+                """,
+                (payload.child_id, item.date),
+            )
+            existing_row = cur.fetchone()
+            if payload.raw.get("replace_hourly_records"):
+                hourly_records = [
+                    record
+                    for record in (normalized_hour_record(record, item.date) for record in item.hourly_records)
+                    if record
+                ]
+                hourly_records = [hourly_records[key] for key in sorted(range(len(hourly_records)), key=lambda index: hourly_records[index]["hour_start"])]
+            else:
+                hourly_records = merged_hourly_records(
+                    existing_row.get("intervals_json") if existing_row else None,
+                    item.hourly_records,
+                    item.date,
+                )
+            worn_hours = round(min(24.0, sum(float(record["worn_hours"]) for record in hourly_records)), 1)
+            if not hourly_records:
+                worn_hours = round(float(item.worn_hours), 1)
             intervals_payload = {
                 "source": "bluetooth_device",
                 "device_name": payload.device_name,
@@ -540,8 +703,9 @@ def sync_device_wear(payload: DeviceWearSyncRequest):
                 "sample_count": item.sample_count,
                 "worn_count": item.worn_count,
                 "sample_interval_minutes": item.sample_interval_minutes,
-                "hourly_records": item.hourly_records,
+                "hourly_records": hourly_records,
                 "raw": payload.raw,
+                "merged_from_existing": bool(existing_row),
             }
             cur.execute(
                 """
@@ -590,6 +754,32 @@ def list_alerts(child_id: str = "demo-child"):
         )
         rows = cur.fetchall()
     return {"items": [iso_row(row) for row in rows]}
+
+
+@app.post("/api/v1/alerts/{alert_id}/handle")
+def handle_alert(alert_id: str):
+    with db_cursor(commit=True) as cur:
+        cur.execute("SELECT id FROM alerts WHERE id = %s", (alert_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="alert not found")
+        cur.execute(
+            """
+            UPDATE alerts
+            SET status = 'handled'
+            WHERE id = %s
+            """,
+            (alert_id,),
+        )
+        cur.execute(
+            """
+            SELECT id, child_id, type, level, title, summary, trigger_detail, status, created_at
+            FROM alerts
+            WHERE id = %s
+            """,
+            (alert_id,),
+        )
+        row = cur.fetchone()
+    return {"item": iso_row(row), "status": "handled"}
 
 
 @app.post("/api/v1/ai/ask")
