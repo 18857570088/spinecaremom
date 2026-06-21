@@ -98,6 +98,9 @@ interface SpineBraceBluetoothCallback {
     fun onTelemetry(telemetry: SpineBraceTelemetry)
     fun onVersion(version: SpineBraceVersion)
     fun onHistory(snapshot: SpineBraceHistorySnapshot)
+    fun onCommandWrite(command: Int, success: Boolean) {}
+    fun onHistoryMtuReady(mtu: Int) {}
+    fun onHistoryMtuUnavailable(mtu: Int?, message: String) {}
 }
 
 class SpineBraceBluetoothManager(
@@ -118,6 +121,7 @@ class SpineBraceBluetoothManager(
     private val devices = linkedMapOf<String, SpineBraceDevice>()
     private val incomingBuffer = ArrayDeque<Byte>()
     private val pendingNotificationDescriptors = ArrayDeque<BluetoothGattDescriptor>()
+    private var pendingWriteCommand: Int? = null
     private val historyPayloads = sortedMapOf<Int, ByteArray>()
     private val historyRawPackets = sortedMapOf<Int, String>()
     private var historyHeader: SpineBraceHistoryHeader? = null
@@ -130,8 +134,14 @@ class SpineBraceBluetoothManager(
     private var scanning = false
     private var bleSetupInProgress = false
     private var serviceDiscoveryRequested = false
+    private var serviceDiscoveryAttempts = 0
+    private var notificationSetupAttempts = 0
     private var connectTimeoutRunnable: Runnable? = null
     private var setupTimeoutRunnable: Runnable? = null
+    private var historyMtuReady = false
+    private var historyMtuInProgress = false
+    private var negotiatedMtu = DEFAULT_ATT_MTU
+    private var historyMtuTimeoutRunnable: Runnable? = null
 
     private val scanCallback =
         object : ScanCallback() {
@@ -207,6 +217,8 @@ class SpineBraceBluetoothManager(
         }
         val activeConnectSession = ++connectSession
         connectingDevice = device
+        serviceDiscoveryAttempts = 0
+        notificationSetupAttempts = 0
         notifyStatus("正在连接 ${device.name}...")
         gatt = remoteDevice.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         if (gatt == null) {
@@ -229,10 +241,46 @@ class SpineBraceBluetoothManager(
     }
 
     fun requestHistory(reportStatus: Boolean = true): Boolean {
+        if (!historyMtuReady) {
+            notifyStatus("MTU尚未设置完成，请等待电量读取和MTU协商后再读取设备数据")
+            return false
+        }
         historyHeader = null
         historyPayloads.clear()
         historyRawPackets.clear()
+        requestFastHistoryConnection("history-command")
         return writeCommand(0x04, successText = "已发送读取一个月穿戴数据指令".takeIf { reportStatus })
+    }
+
+    @SuppressLint("MissingPermission")
+    fun requestHistoryMtu(): Boolean {
+        val targetGatt = gatt
+        if (targetGatt == null) {
+            notifyStatus("请先连接蓝牙设备")
+            return false
+        }
+        if (historyMtuReady) {
+            notifyStatus("MTU已设置为$negotiatedMtu，准备读取设备数据")
+            mainHandler.post { callback.onHistoryMtuReady(negotiatedMtu) }
+            return true
+        }
+        if (historyMtuInProgress) {
+            notifyStatus("正在设置MTU，稍后读取设备数据")
+            return true
+        }
+        historyMtuInProgress = true
+        notifyStatus("正在设置MTU以读取设备数据...")
+        val requested = runCatching { targetGatt.requestMtu(PREFERRED_MTU) }.getOrDefault(false)
+        Log.i(TAG, "request history mtu=$PREFERRED_MTU ok=$requested")
+        if (!requested) {
+            historyMtuInProgress = false
+            val message = "MTU协商启动失败，请重新连接设备"
+            notifyStatus(message)
+            mainHandler.post { callback.onHistoryMtuUnavailable(negotiatedMtu, message) }
+            return false
+        }
+        scheduleHistoryMtuTimeout(targetGatt)
+        return true
     }
 
     fun zeroTemperature() {
@@ -281,7 +329,14 @@ class SpineBraceBluetoothManager(
         cancelSetupTimeout()
         writeCharacteristic = null
         pendingNotificationDescriptors.clear()
+        pendingWriteCommand = null
         bleSetupInProgress = false
+        historyMtuReady = false
+        historyMtuInProgress = false
+        negotiatedMtu = DEFAULT_ATT_MTU
+        cancelHistoryMtuTimeout()
+        serviceDiscoveryAttempts = 0
+        notificationSetupAttempts = 0
         incomingBuffer.clear()
         connectingDevice = null
         connectedDevice = null
@@ -307,6 +362,7 @@ class SpineBraceBluetoothManager(
             return false
         }
         val packet = buildCommandPacket(command, payload)
+        pendingWriteCommand = command
         val ok =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 targetGatt.writeCharacteristic(targetCharacteristic, packet, targetCharacteristic.writeType) == BluetoothGatt.GATT_SUCCESS
@@ -316,12 +372,25 @@ class SpineBraceBluetoothManager(
                 @Suppress("DEPRECATION")
                 targetGatt.writeCharacteristic(targetCharacteristic)
             }
+        Log.i(TAG, "writeCommand command=0x${command.toString(16).padStart(2, '0')} payload=${payload.size} ok=$ok")
         if (ok) {
             successText?.let(::notifyStatus)
         } else if (successText != null) {
             notifyStatus("蓝牙写入失败，请保持设备连接后重试")
         }
+        if (!ok && pendingWriteCommand == command) {
+            pendingWriteCommand = null
+        }
         return ok
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestFastHistoryConnection(reason: String) {
+        val targetGatt = gatt ?: return
+        val ok = runCatching {
+            targetGatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+        }.getOrDefault(false)
+        Log.i(TAG, "request fast history connection reason=$reason ok=$ok")
     }
 
     private val gattCallback =
@@ -340,15 +409,20 @@ class SpineBraceBluetoothManager(
                         }
                         cancelConnectTimeout()
                         serviceDiscoveryRequested = false
+                        serviceDiscoveryAttempts = 0
+                        notificationSetupAttempts = 0
+                        historyMtuReady = false
+                        historyMtuInProgress = false
+                        negotiatedMtu = DEFAULT_ATT_MTU
+                        cancelHistoryMtuTimeout()
                         runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) }
-                        val mtuRequested = runCatching { gatt.requestMtu(REQUESTED_MTU) }.getOrDefault(false)
                         notifyStatus("已连接，正在发现服务...")
                         scheduleSetupTimeout(gatt)
                         mainHandler.postDelayed(
                             {
                                 startServiceDiscovery(gatt)
                             },
-                            if (mtuRequested) BLE_MTU_DISCOVERY_FALLBACK_DELAY_MS else BLE_SERVICE_DISCOVERY_FAST_FALLBACK_DELAY_MS,
+                            BLE_SERVICE_DISCOVERY_DELAY_MS,
                         )
                     }
 
@@ -364,7 +438,7 @@ class SpineBraceBluetoothManager(
                 Log.i(TAG, "onServicesDiscovered status=$status")
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     notifyStatus("服务发现失败：$status")
-                    disconnectInternal(notify = true)
+                    retryServiceDiscovery(gatt, "discover status=$status")
                     return
                 }
                 writeCharacteristic = null
@@ -406,8 +480,8 @@ class SpineBraceBluetoothManager(
                     notifyStatus("未找到可写入的蓝牙通道")
                 }
                 if (writeCharacteristic == null || notifyCount == 0) {
-                    notifyStatus("蓝牙通道初始化失败，请重新连接设备")
-                    disconnectInternal(notify = true)
+                    notifyStatus("蓝牙通道初始化未完成，正在重试")
+                    retryNotificationSetup(gatt, "write=${writeCharacteristic != null} notifyCount=$notifyCount")
                     return
                 }
                 if (item != null) {
@@ -438,12 +512,50 @@ class SpineBraceBluetoothManager(
                 handleIncomingBytes(value)
             }
 
+            override fun onCharacteristicWrite(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int,
+            ) {
+                if (this@SpineBraceBluetoothManager.gatt !== gatt) {
+                    return
+                }
+                val command = pendingWriteCommand
+                pendingWriteCommand = null
+                Log.i(
+                    TAG,
+                    "onCharacteristicWrite command=${command?.let { "0x${it.toString(16).padStart(2, '0')}" } ?: "unknown"} status=$status",
+                )
+                if (command != null) {
+                    mainHandler.post {
+                        callback.onCommandWrite(command, status == BluetoothGatt.GATT_SUCCESS)
+                    }
+                }
+            }
+
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
                 if (this@SpineBraceBluetoothManager.gatt !== gatt) {
                     return
                 }
                 Log.i(TAG, "mtu changed mtu=$mtu status=$status")
-                startServiceDiscovery(gatt)
+                negotiatedMtu = mtu
+                historyMtuInProgress = false
+                cancelHistoryMtuTimeout()
+                if (status == BluetoothGatt.GATT_SUCCESS && mtu >= HISTORY_REQUIRED_MTU) {
+                    historyMtuReady = true
+                    notifyStatus("MTU已设置为$mtu，准备读取设备数据")
+                    mainHandler.post { callback.onHistoryMtuReady(mtu) }
+                } else {
+                    historyMtuReady = false
+                    val message =
+                        if (status == BluetoothGatt.GATT_SUCCESS) {
+                            "MTU为$mtu，未达到读取历史数据要求"
+                        } else {
+                            "MTU协商失败：$status"
+                        }
+                    notifyStatus(message)
+                    mainHandler.post { callback.onHistoryMtuUnavailable(mtu, message) }
+                }
             }
 
             override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
@@ -469,9 +581,15 @@ class SpineBraceBluetoothManager(
         writeCharacteristic = null
         pendingNotificationDescriptors.clear()
         bleSetupInProgress = false
+        historyMtuReady = false
+        historyMtuInProgress = false
+        negotiatedMtu = DEFAULT_ATT_MTU
         serviceDiscoveryRequested = false
+        serviceDiscoveryAttempts = 0
+        notificationSetupAttempts = 0
         cancelConnectTimeout()
         cancelSetupTimeout()
+        cancelHistoryMtuTimeout()
         notifyStatus("BLE连接断开 status=$status")
         notifyDisconnected()
     }
@@ -500,7 +618,7 @@ class SpineBraceBluetoothManager(
             Runnable {
                 if (this.gatt === gatt && connectedDevice == null) {
                     notifyStatus("蓝牙服务初始化超时，请重新连接设备")
-                    disconnectInternal(notify = true)
+                    retryServiceDiscovery(gatt, "setup timeout")
                 }
             }
         setupTimeoutRunnable = timeoutRunnable
@@ -512,6 +630,83 @@ class SpineBraceBluetoothManager(
         setupTimeoutRunnable = null
     }
 
+    private fun scheduleHistoryMtuTimeout(gatt: BluetoothGatt) {
+        cancelHistoryMtuTimeout()
+        val timeoutRunnable =
+            Runnable {
+                if (this.gatt === gatt && historyMtuInProgress) {
+                    historyMtuInProgress = false
+                    val message = "MTU协商超时，请重新连接设备后再读取"
+                    Log.w(TAG, message)
+                    notifyStatus(message)
+                    callback.onHistoryMtuUnavailable(negotiatedMtu, message)
+                }
+            }
+        historyMtuTimeoutRunnable = timeoutRunnable
+        mainHandler.postDelayed(timeoutRunnable, BLE_MTU_NEGOTIATION_TIMEOUT_MS)
+    }
+
+    private fun cancelHistoryMtuTimeout() {
+        historyMtuTimeoutRunnable?.let(mainHandler::removeCallbacks)
+        historyMtuTimeoutRunnable = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun retryServiceDiscovery(gatt: BluetoothGatt, reason: String) {
+        if (this.gatt !== gatt) {
+            return
+        }
+        if (serviceDiscoveryAttempts >= MAX_BLE_SERVICE_DISCOVERY_RETRIES) {
+            Log.w(TAG, "service discovery exhausted reason=$reason")
+            notifyStatus("蓝牙服务发现失败，请靠近设备后重试")
+            disconnectInternal(notify = true)
+            return
+        }
+        serviceDiscoveryAttempts += 1
+        serviceDiscoveryRequested = false
+        writeCharacteristic = null
+        pendingNotificationDescriptors.clear()
+        bleSetupInProgress = false
+        notifyStatus("蓝牙服务发现未完成，正在重试（第${serviceDiscoveryAttempts}次）")
+        Log.w(TAG, "retry service discovery attempt=$serviceDiscoveryAttempts reason=$reason")
+        mainHandler.postDelayed(
+            {
+                if (this.gatt === gatt && connectedDevice == null) {
+                    startServiceDiscovery(gatt)
+                }
+            },
+            BLE_SERVICE_DISCOVERY_RETRY_DELAY_MS,
+        )
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun retryNotificationSetup(gatt: BluetoothGatt, reason: String) {
+        if (this.gatt !== gatt) {
+            return
+        }
+        if (notificationSetupAttempts >= MAX_BLE_NOTIFICATION_SETUP_RETRIES) {
+            Log.w(TAG, "notification setup exhausted reason=$reason")
+            notifyStatus("蓝牙通知通道初始化失败，请靠近设备后重试")
+            disconnectInternal(notify = true)
+            return
+        }
+        notificationSetupAttempts += 1
+        serviceDiscoveryRequested = false
+        writeCharacteristic = null
+        pendingNotificationDescriptors.clear()
+        bleSetupInProgress = false
+        notifyStatus("蓝牙通知通道未就绪，正在重试（第${notificationSetupAttempts}次）")
+        Log.w(TAG, "retry notification setup attempt=$notificationSetupAttempts reason=$reason")
+        mainHandler.postDelayed(
+            {
+                if (this.gatt === gatt && connectedDevice == null) {
+                    startServiceDiscovery(gatt)
+                }
+            },
+            BLE_SERVICE_DISCOVERY_RETRY_DELAY_MS,
+        )
+    }
+
     @SuppressLint("MissingPermission")
     private fun startServiceDiscovery(gatt: BluetoothGatt) {
         if (this.gatt !== gatt || serviceDiscoveryRequested) {
@@ -521,7 +716,7 @@ class SpineBraceBluetoothManager(
         Log.i(TAG, "startServiceDiscovery")
         if (!gatt.discoverServices()) {
             notifyStatus("蓝牙服务发现启动失败，请重新连接设备")
-            disconnectInternal(notify = true)
+            retryServiceDiscovery(gatt, "discoverServices returned false")
         }
     }
 
@@ -529,7 +724,7 @@ class SpineBraceBluetoothManager(
     private fun queueNotification(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic): Boolean {
         val enabled = gatt.setCharacteristicNotification(characteristic, true)
         val descriptor = characteristic.getDescriptor(CLIENT_CONFIG_UUID)
-        if (descriptor != null) {
+        if (enabled && descriptor != null) {
             @Suppress("DEPRECATION")
             descriptor.value =
                 if (characteristic.properties.hasAny(BluetoothGattCharacteristic.PROPERTY_INDICATE)) {
@@ -602,7 +797,10 @@ class SpineBraceBluetoothManager(
             }
             repeat(packetLength) { incomingBuffer.removeFirst() }
             when (command) {
-                0x03 -> parseTelemetry(packet)?.let(::notifyTelemetry)
+                0x03 -> parseTelemetry(packet)?.let { telemetry ->
+                    Log.i(TAG, "telemetry battery=${telemetry.batteryPercent} worn=${telemetry.worn}")
+                    notifyTelemetry(telemetry)
+                }
                 0x04 -> parseHistoryPacket(packet)
                 0x06 -> parseVersion(packet)?.let(::notifyVersion)
             }
@@ -616,6 +814,12 @@ class SpineBraceBluetoothManager(
         if (snapshot.size < HISTORY_PACKET_SIZE) {
             return null
         }
+        if (snapshot.size >= HISTORY_MTU_PACKET_SIZE) {
+            val mtuPacket = snapshot.take(HISTORY_MTU_PACKET_SIZE).toByteArray()
+            if (hasValidCrc(mtuPacket)) {
+                return HISTORY_MTU_PACKET_SIZE
+            }
+        }
         val first = snapshot.take(HISTORY_PACKET_SIZE).toByteArray()
         if (hasValidCrc(first)) {
             return HISTORY_PACKET_SIZE
@@ -625,6 +829,9 @@ class SpineBraceBluetoothManager(
             if (hasValidCrc(alt)) {
                 return HISTORY_ALT_PACKET_SIZE
             }
+        }
+        if (snapshot.size < HISTORY_MTU_PACKET_SIZE) {
+            return null
         }
         return HISTORY_PACKET_SIZE
     }
@@ -665,6 +872,7 @@ class SpineBraceBluetoothManager(
         if (isHeader) {
             historyRawPackets[0] = packet.toHexString()
             historyHeader = parseHistoryHeader(data)
+            requestFastHistoryConnection("history-header")
         } else {
             val sequence = data[0].toInt() and 0xFF
             val header = historyHeader
@@ -732,7 +940,13 @@ class SpineBraceBluetoothManager(
                 "--"
             }
         val nextSeconds = parseNextSaveSeconds(data)
-        return SpineBraceHistoryHeader(head = head, count = count, deviceTimeText = timeText, nextSaveSeconds = nextSeconds, deviceTime = deviceTime)
+        return SpineBraceHistoryHeader(
+            head = head,
+            count = count,
+            deviceTimeText = timeText,
+            nextSaveSeconds = nextSeconds,
+            deviceTime = deviceTime,
+        )
     }
 
     private fun parseNextSaveSeconds(data: ByteArray): Int {
@@ -763,7 +977,7 @@ class SpineBraceBluetoothManager(
             header != null &&
                 when {
                     header.count == 0 -> true
-                    expectedCount != null -> hasCompleteHistoryPayloadSet()
+                    expectedCount != null -> visibleBits.size >= expectedCount
                     else -> hasCompleteHistoryPayloadSet()
                 }
         if (header != null) {
@@ -1002,16 +1216,22 @@ class SpineBraceBluetoothManager(
         const val SCAN_TIMEOUT_MS = 10_000L
         const val BLE_CONNECT_TIMEOUT_MS = 10_000L
         const val BLE_SETUP_TIMEOUT_MS = 30_000L
-        const val BLE_MTU_DISCOVERY_FALLBACK_DELAY_MS = 6_000L
-        const val BLE_SERVICE_DISCOVERY_FAST_FALLBACK_DELAY_MS = 600L
-        const val REQUESTED_MTU = 247
+        const val BLE_MTU_NEGOTIATION_TIMEOUT_MS = 3_000L
+        const val BLE_SERVICE_DISCOVERY_DELAY_MS = 500L
+        const val BLE_SERVICE_DISCOVERY_RETRY_DELAY_MS = 900L
+        const val MAX_BLE_SERVICE_DISCOVERY_RETRIES = 2
+        const val MAX_BLE_NOTIFICATION_SETUP_RETRIES = 2
+        const val PREFERRED_MTU = 200
+        const val HISTORY_REQUIRED_MTU = 189
+        const val DEFAULT_ATT_MTU = 23
         const val MIN_PACKET_SIZE = 5
-        const val MAX_BUFFER_SIZE = 512
+        const val MAX_BUFFER_SIZE = 2_048
         const val TELEMETRY_PACKET_SIZE = 15
         const val HISTORY_PACKET_SIZE = 18
         const val HISTORY_ALT_PACKET_SIZE = 20
-        const val EXPECTED_HISTORY_DATA_PACKETS = 45
-        const val HISTORY_PAYLOAD_BYTES = 12
+        const val EXPECTED_HISTORY_DATA_PACKETS = 3
+        const val HISTORY_PAYLOAD_BYTES = 180
+        const val HISTORY_MTU_PACKET_SIZE = 3 + 1 + HISTORY_PAYLOAD_BYTES + 2
         const val MAX_HISTORY_BITS = EXPECTED_HISTORY_DATA_PACKETS * HISTORY_PAYLOAD_BYTES * 8
         const val START_ANCHOR_MAX_DRIFT_MINUTES = 180L
         const val ANCHOR_SWITCH_MARGIN_MINUTES = 5L

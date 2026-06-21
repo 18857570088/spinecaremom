@@ -352,6 +352,10 @@ class MainActivity : AppCompatActivity() {
     private var autoConnectTimeoutRunnable: Runnable? = null
     private var autoDisconnectRunnable: Runnable? = null
     private var pendingAutoDisconnectNotice = false
+    private var pendingDeviceSyncDisconnectNotice = false
+    private var pendingDeviceReadCompleteDisconnectNotice = false
+    private var userRequestedBluetoothDisconnect = false
+    private var pendingBluetoothConnectionDevice: SpineBraceDevice? = null
     private var latestBraceTelemetry: SpineBraceTelemetry? = null
     private var latestBraceVersion: SpineBraceVersion? = null
     private var latestHistorySnapshot: SpineBraceHistorySnapshot? = null
@@ -364,6 +368,13 @@ class MainActivity : AppCompatActivity() {
     private var latestUploadCompletedAt: LocalDateTime? = null
     private var latestUploadDailyCount = 0
     private var latestUploadTotalWornHours = 0.0
+    private var pendingClearUploadPackage: DeviceWearUploadPackage? = null
+    private var pendingClearTimeoutRunnable: Runnable? = null
+    private var initialTelemetryWaitRunnable: Runnable? = null
+    private var waitingForInitialTelemetry = false
+    private var waitingForHistoryMtu = false
+    private var pendingInitialTelemetrySyncResetRetryCounters = true
+    private var bluetoothConnectStabilizeRetries = 0
     private var latestUploadDeviceName: String? = null
     private var latestUploadStatus = "暂无上传数据"
     private var pendingBluetoothAction: (() -> Unit)? = null
@@ -381,8 +392,12 @@ class MainActivity : AppCompatActivity() {
     private val prefs by lazy { getSharedPreferences(PREFS_NAME, MODE_PRIVATE) }
     private val child = ChildProfile()
     private val languages = listOf("简体中文", "English", "日本語", "한국어", "Español", "Français", "Deutsch")
+    private val functionBoundaryNotice =
+        "本项目功能边界为记录、提醒、整理和报告，不提供诊断、治疗决策、疗效判断或医生端远程管理。"
+    private val reportBoundaryNotice =
+        "本报告基于用户绑定设备采集的运动/姿态数据自动生成，用于帮助用户回顾支具佩戴情况并在复诊时进行沟通。报告内容不构成诊断、治疗建议或疗效判断。请以医生面诊意见为准。"
     private val disclaimer =
-        "本回答仅供健康科普与参考，不替代医生的诊断与医嘱；如有疑虑请及时咨询主治医生或支具师。"
+        "$functionBoundaryNotice$reportBoundaryNotice"
     private val emergencyKeywords =
         listOf("呼吸困难", "喘不上气", "胸闷气短", "无法呼吸", "皮肤破溃", "破皮", "流脓", "溃烂", "水泡破了", "疼痛持续", "疼了好几天", "夜里疼醒", "麻木", "无力", "晕倒", "高烧", "伤口感染")
     private val chatMessages =
@@ -436,6 +451,9 @@ class MainActivity : AppCompatActivity() {
                     resumingDeviceSyncAfterDisconnect = false
                     connectedBluetoothDevice = device
                     selectedBluetoothDevice = device
+                    pendingBluetoothConnectionDevice = device
+                    userRequestedBluetoothDisconnect = false
+                    pendingDeviceReadCompleteDisconnectNotice = false
                     saveLastBluetoothDevice(device)
                     cancelAutoConnectTimeout()
                     autoConnectTargetDevice = null
@@ -465,13 +483,24 @@ class MainActivity : AppCompatActivity() {
                     latestUploadDailyCount = 0
                     latestUploadTotalWornHours = 0.0
                     latestUploadDeviceName = device.name
-                    latestUploadStatus = "正在读取设备数据，准备上传云端"
-                    startAutoDeviceDataSync(resetRetryCounters = !resumingSync)
+                    deviceSyncCompleted = false
+                    latestUploadStatus = "蓝牙已连接，正在读取电量"
+                    bluetoothStatusMessage = latestUploadStatus
+                    scheduleInitialTelemetryThenDeviceSync(resetRetryCounters = !resumingSync)
                     refreshBluetoothUi()
                 }
 
                 override fun onDisconnected() {
                     if (handleDeviceSyncDisconnected()) {
+                        return
+                    }
+                    if (handleHistoryMtuDisconnected()) {
+                        return
+                    }
+                    if (handleInitialTelemetryDisconnected()) {
+                        return
+                    }
+                    if (handleBluetoothStartupDisconnected()) {
                         return
                     }
                     val phase = prefs.getString(KEY_DEVICE_SYNC_PHASE, null)
@@ -482,10 +511,15 @@ class MainActivity : AppCompatActivity() {
                     latestBraceTelemetry = null
                     pendingHistoryUploadRunnable?.let(mainHandler::removeCallbacks)
                     pendingHistoryUploadRunnable = null
+                    waitingForInitialTelemetry = false
+                    waitingForHistoryMtu = false
+                    cancelInitialTelemetryWait()
                     cancelHistoryReadTimeout()
                     cancelAutoConnectTimeout()
                     autoConnectInProgress = false
                     autoConnectTargetDevice = null
+                    pendingBluetoothConnectionDevice = null
+                    userRequestedBluetoothDisconnect = false
                     if (!preserveLocalCloudUpload) {
                         deviceSyncInProgress = false
                         deviceSyncUploading = false
@@ -496,11 +530,21 @@ class MainActivity : AppCompatActivity() {
                         setHomeBluetoothWarning(null)
                     }
                     val disconnectedStatusMessage =
-                        if (pendingAutoDisconnectNotice) {
-                            pendingAutoDisconnectNotice = false
-                            "蓝牙连续连接已超过10分钟，已自动断开"
-                        } else {
-                            "蓝牙已断开"
+                        when {
+                            pendingDeviceReadCompleteDisconnectNotice -> {
+                                pendingDeviceReadCompleteDisconnectNotice = false
+                                pendingDeviceSyncDisconnectNotice = false
+                                "数据读取完成，蓝牙已断开"
+                            }
+                            pendingDeviceSyncDisconnectNotice -> {
+                                pendingDeviceSyncDisconnectNotice = false
+                                "设备数据已迁移到手机，蓝牙已断开"
+                            }
+                            pendingAutoDisconnectNotice -> {
+                                pendingAutoDisconnectNotice = false
+                                "蓝牙连续连接已超过10分钟，已自动断开"
+                            }
+                            else -> "蓝牙已断开"
                         }
                     bluetoothStatusMessage =
                         if (preserveLocalCloudUpload) {
@@ -514,6 +558,17 @@ class MainActivity : AppCompatActivity() {
                 override fun onTelemetry(telemetry: SpineBraceTelemetry) {
                     val hadTelemetry = latestBraceTelemetry != null
                     latestBraceTelemetry = telemetry
+                    if (waitingForInitialTelemetry) {
+                        waitingForInitialTelemetry = false
+                        cancelInitialTelemetryWait()
+                        bluetoothConnectStabilizeRetries = 0
+                        updateBatteryHomeWarning(telemetry)
+                        bluetoothStatusMessage = "收到电量数据：${telemetry.batteryText}"
+                        latestUploadStatus = "电量读取完成，正在设置MTU"
+                        refreshBluetoothUi()
+                        requestHistoryMtuAfterInitialTelemetry()
+                        return
+                    }
                     if (hadTelemetry) {
                         return
                     }
@@ -529,7 +584,34 @@ class MainActivity : AppCompatActivity() {
                         return
                     }
                     bluetoothStatusMessage = "收到电量数据：${telemetry.batteryText}"
+                    latestUploadStatus = "电量读取完成，正在设置MTU"
                     refreshBluetoothUi()
+                    requestHistoryMtuAfterInitialTelemetry()
+                }
+
+                override fun onHistoryMtuReady(mtu: Int) {
+                    if (!waitingForHistoryMtu) {
+                        return
+                    }
+                    waitingForHistoryMtu = false
+                    latestUploadStatus = "MTU设置完成，正在读取设备数据"
+                    bluetoothStatusMessage = latestUploadStatus
+                    refreshBluetoothUi()
+                    scheduleDeviceSyncAfterInitialTelemetry()
+                }
+
+                override fun onHistoryMtuUnavailable(mtu: Int?, message: String) {
+                    if (!waitingForHistoryMtu) {
+                        return
+                    }
+                    waitingForHistoryMtu = false
+                    latestUploadStatus = message
+                    bluetoothStatusMessage = message
+                    refreshBluetoothUi()
+                    retryInitialTelemetryConnection(
+                        message = "MTU设置未完成，正在重新连接",
+                        resetGatt = true,
+                    )
                 }
 
                 override fun onVersion(version: SpineBraceVersion) {
@@ -555,6 +637,12 @@ class MainActivity : AppCompatActivity() {
                         bluetoothStatusMessage = snapshot.summaryText
                     }
                     refreshBluetoothUi()
+                }
+
+                override fun onCommandWrite(command: Int, success: Boolean) {
+                    if (command == 0x01) {
+                        handleDeviceHistoryClearWrite(success)
+                    }
                 }
             },
         )
@@ -924,6 +1012,7 @@ class MainActivity : AppCompatActivity() {
         if (isProfileCompleted()) {
             routeAfterLogin()
             render()
+            maybeAutoConnectAfterLogin()
             return
         }
         if (profileCloudLookupInProgress) {
@@ -944,12 +1033,14 @@ class MainActivity : AppCompatActivity() {
                     }
                     routeAfterLogin()
                     render()
+                    maybeAutoConnectAfterLogin()
                 }
             }.onFailure {
                 mainHandler.post {
                     profileCloudLookupInProgress = false
                     routeAfterLogin()
                     render()
+                    maybeAutoConnectAfterLogin()
                 }
             }
         }
@@ -963,6 +1054,17 @@ class MainActivity : AppCompatActivity() {
                 else -> Stage.Profile
             }
         currentTab = MainTab.Home
+    }
+
+    private fun maybeAutoConnectAfterLogin() {
+        if (stage != Stage.App) {
+            return
+        }
+        mainHandler.post {
+            if (!resumePendingLocalWearUploadIfNeeded()) {
+                autoConnectLastBluetoothDevice()
+            }
+        }
     }
 
     private fun continueAfterDeviceBinding() {
@@ -1334,6 +1436,10 @@ class MainActivity : AppCompatActivity() {
             render()
         })
         addSpace(12)
+        addView(infoStrip(functionBoundaryNotice))
+        addSpace(8)
+        addView(infoStrip(reportBoundaryNotice))
+        addSpace(12)
         when (reportTab) {
             0 -> addAiReports()
             1 -> addVisitReport()
@@ -1577,6 +1683,7 @@ class MainActivity : AppCompatActivity() {
                         setPadding(dp(14), dp(14), dp(14), dp(14))
                         addView(label("Spinecare Mom 复诊报告", 17f, P.text, Typeface.BOLD, Gravity.CENTER))
                         addSpace(10)
+                        addPaperRow("报告声明", reportBoundaryNotice)
                         addPaperRow("基本信息", visitReportBasicInfo())
                         addPaperRow("佩戴摘要", visitReportWearSummary(reportRecords))
                         addPaperRow("佩戴至今记录", visitReportWearAllSummary())
@@ -1714,6 +1821,7 @@ class MainActivity : AppCompatActivity() {
             item.payload.optJSONArray("daily_records")?.let { rows ->
                 if (rows.length() > 0) addPaperRow("每日记录", "已保存${rows.length()}天每日佩戴快照")
             }
+            addPaperRow("报告声明", item.payload.cleanString("disclaimer") ?: reportBoundaryNotice)
             addPaperRow("PDF文件", item.pdfUrl ?: "暂未生成真实PDF文件")
         }
 
@@ -1958,6 +2066,8 @@ class MainActivity : AppCompatActivity() {
             .put("report_type", "复诊报告")
             .put("child_id", child.id)
             .put("generated_at", LocalDateTime.now().toString())
+            .put("function_boundary", functionBoundaryNotice)
+            .put("disclaimer", reportBoundaryNotice)
             .put("period_label", visitReportPeriodLabel(records))
             .put("basic_info", visitReportBasicInfo())
             .put("wear_summary", visitReportWearSummary(records))
@@ -1975,6 +2085,8 @@ class MainActivity : AppCompatActivity() {
             .put("report_type", archiveReportKindLabel(aiArchiveKindFor(item)))
             .put("child_id", child.id)
             .put("generated_at", LocalDateTime.now().toString())
+            .put("function_boundary", functionBoundaryNotice)
+            .put("disclaimer", reportBoundaryNotice)
             .put("status", item.status)
             .put("summary", item.subtitle)
             .put("basic_info", visitReportBasicInfo())
@@ -3079,7 +3191,7 @@ class MainActivity : AppCompatActivity() {
                 "八、报告与归档" to "AI报告、复诊报告和归档均基于云端佩戴、皮肤、生长、影像及建档信息生成。归档会保存生成当时的数据快照，后续数据变化不会自动改写已归档报告。",
                 "九、导出与删除" to "导出数据用于删除前备份。删除全部数据前必须先导出备份、勾选确认项、输入孩子昵称和确认文字，并经过冷静期，避免误删除。删除完成后云端数据不可恢复。",
                 "十、语言与设置" to "设置页可切换中文、英文、日语、韩语、西班牙语、法语、德语，并可管理蓝牙连接。语言选择会保存到本机，后续打开APP时继续沿用。",
-                "十一、医疗安全提示" to "本APP用于家庭佩戴管理和复诊资料整理，不提供诊断、处方或支具调整结论。出现疼痛、皮肤破损、麻木、呼吸不适或其他紧急情况时，应及时联系医生或支具师。",
+                "十一、功能边界与医疗安全提示" to "本APP用于家庭佩戴记录、提醒、整理和报告，不提供诊断、治疗决策、疗效判断或医生端远程管理。报告和AI解读仅用于帮助用户回顾支具佩戴情况并在复诊时沟通，不构成诊断、治疗建议或疗效判断，请以医生面诊意见为准。出现疼痛、皮肤破损、麻木、呼吸不适或其他紧急情况时，应及时联系医生或支具师。",
                 "十二、联系方式" to "运营主体：绍兴维脉科技有限公司；地址：浙江省绍兴市越城区袍中北路631号；邮箱：zclei@vip.sina.com。可在“联系我们”页面扫描微信二维码添加客服。",
             ),
             en = listOf(
@@ -3232,7 +3344,7 @@ class MainActivity : AppCompatActivity() {
                 "二、服务内容" to "本APP提供孩子建档、支具蓝牙设备绑定、佩戴数据读取与云端同步、首页统计、皮肤/生长/影像记录、AI辅助解读、复诊报告、归档、导出备份和删除全部数据等服务。",
                 "三、监护人责任" to "本APP面向未成年人健康管理场景。监护人应确认有权录入和管理相关数据，确保所录入的孩子资料、医嘱信息、照片和记录真实、准确、及时更新，并妥善保管手机和账号使用权限。",
                 "四、设备绑定与数据同步" to "用户应使用真实、合法取得的 WM-SP# 前缀蓝牙设备。蓝牙连接后APP会读取佩戴数据并上传云端，上传成功后可清除设备端已存储佩戴数据。因设备未开机、蓝牙异常、网络异常或用户误操作导致的数据缺失，用户应及时检查并重新同步。",
-                "五、医疗免责声明" to "本APP不是医疗诊断、处方或治疗工具。AI解读、报告摘要、颜色预警、复诊资料和提醒仅供家庭健康管理参考，不替代医生诊断、医嘱、复诊安排或支具师调整意见。",
+                "五、功能边界与医疗免责声明" to "本APP功能边界为记录、提醒、整理和报告，不做诊断、治疗决策、疗效判断或医生端远程管理。AI解读、报告摘要、颜色预警、复诊资料和提醒仅供家庭佩戴管理和复诊沟通参考，不替代医生诊断、医嘱、复诊安排或支具师调整意见。报告内容不构成诊断、治疗建议或疗效判断，请以医生面诊意见为准。",
                 "六、数据与报告" to "用户上传或同步的数据会用于首页统计、智能解读、复诊报告、归档和导出备份。归档报告保存生成时的数据快照，后续数据变化不会自动改写已归档报告。",
                 "七、用户行为规范" to "用户不得上传违法、侵权、恶意、虚假或与本服务无关的内容，不得尝试破坏服务、绕过安全限制、冒用他人信息、伪造佩戴数据或干扰云端数据库正常运行。",
                 "八、知识产权" to "本APP及相关系统、页面设计、算法逻辑、界面元素、文案、代码和报告模板等内容的知识产权归绍兴维脉科技有限公司或相关权利人所有。未经书面许可，不得复制、修改、传播、反编译或用于商业用途。",
@@ -3700,8 +3812,11 @@ class MainActivity : AppCompatActivity() {
                                 bluetoothStatusMessage = "请先扫描并选择 WM-SP# 设备"
                                 refreshBluetoothUi()
                             } else {
-                                selectedBluetoothDevice = device
-                                spineBraceBluetooth.connect(device)
+                                beginBluetoothConnection(
+                                    device,
+                                    resetRetryCounters = true,
+                                    statusMessage = "正在连接 ${device.name}...",
+                                )
                             }
                         }
                     }.apply {
@@ -3709,7 +3824,11 @@ class MainActivity : AppCompatActivity() {
                     }, weightLp(1f))
                     addSpace(8, horizontal = true)
                     addView(dangerButton("断开") {
-                        runWithBluetoothPermissions { spineBraceBluetooth.disconnect() }
+                        runWithBluetoothPermissions {
+                            userRequestedBluetoothDisconnect = true
+                            pendingBluetoothConnectionDevice = null
+                            spineBraceBluetooth.disconnect()
+                        }
                     }.apply {
                         setBluetoothButtonEnabled(this, connectedBluetoothDevice != null)
                     }, weightLp(1f))
@@ -4180,6 +4299,75 @@ class MainActivity : AppCompatActivity() {
             listOf(Manifest.permission.ACCESS_FINE_LOCATION)
         }
 
+    private fun beginBluetoothConnection(
+        device: SpineBraceDevice,
+        resetRetryCounters: Boolean = false,
+        statusMessage: String? = null,
+    ) {
+        selectedBluetoothDevice = device
+        pendingBluetoothConnectionDevice = device
+        userRequestedBluetoothDisconnect = false
+        if (resetRetryCounters) {
+            bluetoothConnectStabilizeRetries = 0
+        }
+        waitingForInitialTelemetry = false
+        cancelInitialTelemetryWait()
+        latestBraceTelemetry = null
+        statusMessage?.let {
+            bluetoothStatusMessage = it
+        }
+        refreshBluetoothUi()
+        spineBraceBluetooth.connect(device)
+    }
+
+    private fun handleBluetoothStartupDisconnected(): Boolean {
+        if (userRequestedBluetoothDisconnect || pendingAutoDisconnectNotice || pendingDeviceSyncDisconnectNotice) {
+            return false
+        }
+        if (deviceSyncCompleted || deviceSyncUploading) {
+            return false
+        }
+        val retryTarget =
+            pendingBluetoothConnectionDevice
+                ?: selectedBluetoothDevice
+                ?: autoConnectTargetDevice
+                ?: loadLastBluetoothDevice()
+                ?: return false
+        if (bluetoothConnectStabilizeRetries >= MAX_BLUETOOTH_CONNECT_STABILIZE_RETRIES) {
+            autoConnectInProgress = false
+            autoConnectTargetDevice = null
+            pendingBluetoothConnectionDevice = null
+            bluetoothStatusMessage = "蓝牙连接不稳定，请将设备靠近手机后重新连接"
+            latestUploadStatus = bluetoothStatusMessage
+            Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+            refreshBluetoothUi()
+            return true
+        }
+        bluetoothConnectStabilizeRetries += 1
+        selectedBluetoothDevice = retryTarget
+        pendingBluetoothConnectionDevice = retryTarget
+        connectedBluetoothDevice = null
+        latestBraceTelemetry = null
+        waitingForInitialTelemetry = false
+        cancelInitialTelemetryWait()
+        cancelBluetoothAutoDisconnect()
+        bluetoothStatusMessage = "蓝牙连接未稳定，正在重新连接（第${bluetoothConnectStabilizeRetries}次），请将设备靠近手机"
+        latestUploadStatus = bluetoothStatusMessage
+        refreshBluetoothUi()
+        spineBraceBluetooth.close()
+        mainHandler.postDelayed(
+            {
+                if (connectedBluetoothDevice == null && pendingBluetoothConnectionDevice?.matchesBluetoothDevice(retryTarget) == true) {
+                    runWithBluetoothPermissions {
+                        beginBluetoothConnection(retryTarget, resetRetryCounters = false)
+                    }
+                }
+            },
+            BLUETOOTH_STABILIZE_RECONNECT_DELAY_MS,
+        )
+        return true
+    }
+
     private fun autoConnectLastBluetoothDevice() {
         if (connectedBluetoothDevice != null || autoConnectInProgress) {
             return
@@ -4187,6 +4375,7 @@ class MainActivity : AppCompatActivity() {
         val lastDevice = loadLastBluetoothDevice() ?: return
         autoConnectTargetDevice = lastDevice
         autoConnectInProgress = true
+        bluetoothConnectStabilizeRetries = 0
         selectedBluetoothDevice = lastDevice
         bluetoothStatusMessage = "正在自动连接上次设备 ${lastDevice.name}..."
         refreshBluetoothUi()
@@ -4212,8 +4401,15 @@ class MainActivity : AppCompatActivity() {
             } ?: return
         cancelAutoConnectTimeout()
         selectedBluetoothDevice = matched
+        bluetoothConnectStabilizeRetries = 0
         bluetoothStatusMessage = "正在自动连接上次设备 ${matched.name}..."
-        spineBraceBluetooth.connect(matched)
+        runWithBluetoothPermissions {
+            beginBluetoothConnection(
+                matched,
+                resetRetryCounters = false,
+                statusMessage = bluetoothStatusMessage,
+            )
+        }
     }
 
     private fun scheduleAutoConnectTimeout() {
@@ -4262,6 +4458,22 @@ class MainActivity : AppCompatActivity() {
     private fun cancelBluetoothAutoDisconnect() {
         autoDisconnectRunnable?.let(mainHandler::removeCallbacks)
         autoDisconnectRunnable = null
+    }
+
+    private fun scheduleBluetoothDisconnectAfterReadComplete() {
+        if (connectedBluetoothDevice == null) {
+            return
+        }
+        cancelBluetoothAutoDisconnect()
+        pendingDeviceReadCompleteDisconnectNotice = true
+        mainHandler.postDelayed(
+            {
+                if (pendingDeviceReadCompleteDisconnectNotice && connectedBluetoothDevice != null) {
+                    spineBraceBluetooth.disconnect()
+                }
+            },
+            DEVICE_READ_COMPLETE_DISCONNECT_DELAY_MS,
+        )
     }
 
     private fun updateBatteryHomeWarning(telemetry: SpineBraceTelemetry) {
@@ -4358,9 +4570,122 @@ class MainActivity : AppCompatActivity() {
         setHomeBluetoothWarning(DEVICE_SYNC_INTERRUPTED_WARNING_MESSAGE)
     }
 
+    private fun scheduleInitialTelemetryThenDeviceSync(resetRetryCounters: Boolean) {
+        cancelInitialTelemetryWait()
+        waitingForInitialTelemetry = true
+        waitingForHistoryMtu = false
+        pendingInitialTelemetrySyncResetRetryCounters = resetRetryCounters
+        val runnable =
+            Runnable {
+                initialTelemetryWaitRunnable = null
+                if (waitingForInitialTelemetry && connectedBluetoothDevice != null) {
+                    retryInitialTelemetryConnection(
+                        message = "蓝牙已连接但未收到电量数据，正在重新连接",
+                        resetGatt = true,
+                    )
+                }
+            }
+        initialTelemetryWaitRunnable = runnable
+        mainHandler.postDelayed(runnable, DEVICE_INITIAL_TELEMETRY_WAIT_MS)
+    }
+
+    private fun scheduleDeviceSyncAfterInitialTelemetry() {
+        val resetRetryCounters = pendingInitialTelemetrySyncResetRetryCounters
+        mainHandler.postDelayed(
+            {
+                if (connectedBluetoothDevice != null && !waitingForHistoryMtu && !deviceSyncInProgress && !deviceSyncUploading && !deviceSyncCompleted) {
+                    startAutoDeviceDataSync(resetRetryCounters = resetRetryCounters)
+                }
+            },
+            DEVICE_SYNC_AFTER_TELEMETRY_DELAY_MS,
+        )
+    }
+
+    private fun requestHistoryMtuAfterInitialTelemetry() {
+        if (deviceSyncInProgress || deviceSyncUploading || deviceSyncCompleted) {
+            return
+        }
+        waitingForHistoryMtu = true
+        bluetoothStatusMessage = "电量读取完成，正在设置MTU"
+        latestUploadStatus = bluetoothStatusMessage
+        refreshBluetoothUi()
+        val started = spineBraceBluetooth.requestHistoryMtu()
+        if (!started) {
+            waitingForHistoryMtu = false
+            retryInitialTelemetryConnection(
+                message = "MTU设置启动失败，正在重新连接",
+                resetGatt = true,
+            )
+        }
+    }
+
+    private fun cancelInitialTelemetryWait() {
+        initialTelemetryWaitRunnable?.let(mainHandler::removeCallbacks)
+        initialTelemetryWaitRunnable = null
+    }
+
+    private fun handleInitialTelemetryDisconnected(): Boolean {
+        if (!waitingForInitialTelemetry) {
+            return false
+        }
+        return retryInitialTelemetryConnection(
+            message = "蓝牙连接未稳定，正在重新连接",
+            resetGatt = false,
+        )
+    }
+
+    private fun handleHistoryMtuDisconnected(): Boolean {
+        if (!waitingForHistoryMtu) {
+            return false
+        }
+        return retryInitialTelemetryConnection(
+            message = "MTU设置过程中蓝牙断开，正在重新连接",
+            resetGatt = false,
+        )
+    }
+
+    private fun retryInitialTelemetryConnection(message: String, resetGatt: Boolean): Boolean {
+        val retryTarget = selectedBluetoothDevice ?: loadLastBluetoothDevice()
+        waitingForInitialTelemetry = false
+        waitingForHistoryMtu = false
+        cancelInitialTelemetryWait()
+        connectedBluetoothDevice = null
+        latestBraceTelemetry = null
+        cancelBluetoothAutoDisconnect()
+        if (retryTarget != null && bluetoothConnectStabilizeRetries < MAX_BLUETOOTH_CONNECT_STABILIZE_RETRIES) {
+            bluetoothConnectStabilizeRetries += 1
+            selectedBluetoothDevice = retryTarget
+            bluetoothStatusMessage = "$message（第${bluetoothConnectStabilizeRetries}次），请将设备靠近手机"
+            latestUploadStatus = bluetoothStatusMessage
+            refreshBluetoothUi()
+            if (resetGatt) {
+                spineBraceBluetooth.close()
+            }
+            mainHandler.postDelayed(
+                {
+                    if (connectedBluetoothDevice == null && !deviceSyncInProgress && !deviceSyncUploading) {
+                        runWithBluetoothPermissions {
+                            beginBluetoothConnection(retryTarget, resetRetryCounters = false)
+                        }
+                    }
+                },
+                BLUETOOTH_STABILIZE_RECONNECT_DELAY_MS,
+            )
+        } else {
+            bluetoothStatusMessage = "蓝牙连接不稳定，请将设备靠近手机后重新连接"
+            latestUploadStatus = bluetoothStatusMessage
+            Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+            refreshBluetoothUi()
+        }
+        return true
+    }
+
     private fun startAutoDeviceDataSync(resetRetryCounters: Boolean = true) {
         pendingHistoryUploadRunnable?.let(mainHandler::removeCallbacks)
         pendingHistoryUploadRunnable = null
+        waitingForInitialTelemetry = false
+        waitingForHistoryMtu = false
+        cancelInitialTelemetryWait()
         cancelHistoryReadTimeout()
         if (resetRetryCounters) {
             deviceHistoryReadRetries = 0
@@ -4372,6 +4697,8 @@ class MainActivity : AppCompatActivity() {
         deviceSyncInProgress = true
         deviceSyncUploading = false
         deviceSyncCompleted = false
+        pendingClearUploadPackage = null
+        cancelDeviceClearWriteTimeout()
         latestHistorySnapshot = null
         latestHistoryReceivedAt = null
         latestUploadStatus = "正在读取设备数据，准备上传云端"
@@ -4455,7 +4782,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleDeviceSyncDisconnected(): Boolean {
-        if ((!deviceSyncInProgress && !deviceSyncUploading) || deviceSyncCompleted || pendingAutoDisconnectNotice) {
+        if ((!deviceSyncInProgress && !deviceSyncUploading) || deviceSyncCompleted || pendingAutoDisconnectNotice || pendingDeviceSyncDisconnectNotice) {
             return false
         }
         val phase = prefs.getString(KEY_DEVICE_SYNC_PHASE, null)
@@ -4477,6 +4804,30 @@ class MainActivity : AppCompatActivity() {
         cancelHistoryReadTimeout()
         connectedBluetoothDevice = null
         latestBraceTelemetry = null
+        cancelAutoConnectTimeout()
+        cancelBluetoothAutoDisconnect()
+        pendingClearUploadPackage?.let { uploadPackage ->
+            pendingClearUploadPackage = null
+            cancelDeviceClearWriteTimeout()
+            deviceSyncUploading = false
+            deviceSyncInProgress = false
+            deviceSyncCompleted = false
+            resumingDeviceSyncAfterDisconnect = false
+            bluetoothStatusMessage = "蓝牙在清理设备历史时断开；手机本地数据已保存，请重新连接后再获取"
+            latestUploadStatus = bluetoothStatusMessage
+            updateBluetoothUploadValidation(uploadPackage, "设备清理未确认，手机本地数据已保留", completed = true)
+            markDeviceSyncInterrupted(bluetoothStatusMessage)
+            Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+            refreshBluetoothUi()
+            return true
+        }
+        if (!deviceSyncUploading && !pendingDeviceWearFile().exists() && deviceSyncReconnectRetries < MAX_DEVICE_SYNC_RECONNECT_RETRIES) {
+            latestUploadStatus = "蓝牙读取中断，正在重新连接继续读取"
+            bluetoothStatusMessage = latestUploadStatus
+            markDeviceSyncPhase(DEVICE_SYNC_PHASE_READING, latestUploadStatus)
+            retryDeviceSyncConnection(latestUploadStatus)
+            return true
+        }
         deviceSyncUploading = false
         deviceSyncInProgress = false
         deviceSyncCompleted = false
@@ -4514,7 +4865,7 @@ class MainActivity : AppCompatActivity() {
             {
                 if (deviceSyncInProgress && !deviceSyncCompleted) {
                     runWithBluetoothPermissions {
-                        spineBraceBluetooth.connect(retryTarget)
+                        beginBluetoothConnection(retryTarget, resetRetryCounters = false)
                     }
                 }
             },
@@ -4557,6 +4908,7 @@ class MainActivity : AppCompatActivity() {
             clearDeviceSyncPhase()
             loadHomeWearData(force = true)
             Toast.makeText(this, deviceReadCompleteMessage, Toast.LENGTH_SHORT).show()
+            scheduleBluetoothDisconnectAfterReadComplete()
             refreshBluetoothUi()
             return
         }
@@ -4569,6 +4921,7 @@ class MainActivity : AppCompatActivity() {
             clearDeviceSyncPhase()
             loadHomeWearData(force = true)
             Toast.makeText(this, deviceReadCompleteMessage, Toast.LENGTH_SHORT).show()
+            scheduleBluetoothDisconnectAfterReadComplete()
             refreshBluetoothUi()
             return
         }
@@ -4612,6 +4965,8 @@ class MainActivity : AppCompatActivity() {
             deviceSyncInProgress = false
             deviceSyncUploading = false
             deviceSyncCompleted = false
+            pendingClearUploadPackage = null
+            cancelDeviceClearWriteTimeout()
             bluetoothStatusMessage = "设备历史清理失败；手机本地数据已保存，请保持蓝牙连接后重新获取"
             updateBluetoothUploadValidation(uploadPackage, "设备清理失败，手机本地数据已保留", completed = true)
             markDeviceSyncInterrupted(bluetoothStatusMessage)
@@ -4619,9 +4974,56 @@ class MainActivity : AppCompatActivity() {
             refreshBluetoothUi()
             return
         }
+        pendingClearUploadPackage = uploadPackage
+        scheduleDeviceClearWriteTimeout(uploadPackage)
+    }
+
+    private fun scheduleDeviceClearWriteTimeout(uploadPackage: DeviceWearUploadPackage) {
+        cancelDeviceClearWriteTimeout()
+        val expectedSyncId = localDeviceWearSyncId(uploadPackage)
+        val timeoutRunnable =
+            Runnable {
+                pendingClearTimeoutRunnable = null
+                val pendingPackage = pendingClearUploadPackage ?: return@Runnable
+                if (localDeviceWearSyncId(pendingPackage) == expectedSyncId) {
+                    handleDeviceHistoryClearWrite(success = false)
+                }
+            }
+        pendingClearTimeoutRunnable = timeoutRunnable
+        mainHandler.postDelayed(timeoutRunnable, DEVICE_CLEAR_WRITE_TIMEOUT_MS)
+    }
+
+    private fun cancelDeviceClearWriteTimeout() {
+        pendingClearTimeoutRunnable?.let(mainHandler::removeCallbacks)
+        pendingClearTimeoutRunnable = null
+    }
+
+    private fun handleDeviceHistoryClearWrite(success: Boolean) {
+        val uploadPackage = pendingClearUploadPackage ?: return
+        pendingClearUploadPackage = null
+        cancelDeviceClearWriteTimeout()
+        if (!success) {
+            deviceSyncInProgress = false
+            deviceSyncUploading = false
+            deviceSyncCompleted = false
+            bluetoothStatusMessage = "设备历史清理未确认；手机本地数据已保存，请重新连接后再获取"
+            updateBluetoothUploadValidation(uploadPackage, "设备清理未确认，手机本地数据已保留", completed = true)
+            markDeviceSyncInterrupted(bluetoothStatusMessage)
+            Toast.makeText(this, bluetoothStatusMessage, Toast.LENGTH_SHORT).show()
+            refreshBluetoothUi()
+            return
+        }
+        updateBluetoothUploadValidation(uploadPackage, "设备历史已清理，正在从手机本地上传云端", completed = false)
         markDeviceSyncPhase(DEVICE_SYNC_PHASE_PENDING_CLOUD_UPLOAD, "设备历史已清理，等待从手机本地上传云端")
-        pendingAutoDisconnectNotice = true
-        spineBraceBluetooth.disconnect()
+        pendingDeviceSyncDisconnectNotice = true
+        mainHandler.postDelayed(
+            {
+                if (pendingDeviceSyncDisconnectNotice) {
+                    spineBraceBluetooth.disconnect()
+                }
+            },
+            DEVICE_CLEAR_DISCONNECT_DELAY_MS,
+        )
         uploadLocalDeviceWearPackage(uploadPackage)
     }
 
@@ -4955,6 +5357,7 @@ class MainActivity : AppCompatActivity() {
                         deleteLocalDeviceWearPackage()
                         clearDeviceSyncPhase()
                         loadHomeWearData(force = true)
+                        scheduleBluetoothDisconnectAfterReadComplete()
                     } else if (response.optBoolean("ok", false)) {
                         deviceSyncCompleted = false
                         bluetoothStatusMessage = "云端核对失败；手机本地数据已保留，将稍后重试"
@@ -5200,7 +5603,10 @@ class MainActivity : AppCompatActivity() {
         }.getOrNull()
     }
 
-    private fun parseWearHourlyRows(date: LocalDate, intervals: JSONObject?): List<BluetoothValidationHour> {
+    private fun parseWearHourlyRows(
+        date: LocalDate,
+        intervals: JSONObject?,
+    ): List<BluetoothValidationHour> {
         val rows = intervals?.optJSONArray("hourly_records") ?: return emptyList()
         val result = mutableListOf<BluetoothValidationHour>()
         for (index in 0 until rows.length()) {
@@ -5255,12 +5661,13 @@ class MainActivity : AppCompatActivity() {
                     "worn_count",
                     (fallbackWornHours * 6).roundToInt(),
                 ).coerceIn(0, 6)
-            result += BluetoothValidationHour(
-                hourStart = hourStart.withMinute(0).withSecond(0).withNano(0),
-                wornHours = if (normalizedSamples.isNotEmpty()) roundOne(parsedWornCount / 6.0) else fallbackWornHours,
-                sampleCount = if (normalizedSamples.isNotEmpty()) parsedSampleCount else item.optInt("sample_count", 6).coerceIn(0, 6),
-                wornCount = if (normalizedSamples.isNotEmpty()) parsedWornCount else fallbackWornCount,
-                samples = normalizedSamples,
+            result +=
+                BluetoothValidationHour(
+                    hourStart = hourStart.withMinute(0).withSecond(0).withNano(0),
+                    wornHours = if (normalizedSamples.isNotEmpty()) roundOne(parsedWornCount / 6.0) else fallbackWornHours,
+                    sampleCount = if (normalizedSamples.isNotEmpty()) parsedSampleCount else item.optInt("sample_count", 6).coerceIn(0, 6),
+                    wornCount = if (normalizedSamples.isNotEmpty()) parsedWornCount else fallbackWornCount,
+                    samples = normalizedSamples,
             )
         }
         return result.sortedBy { it.hourStart }
@@ -6517,6 +6924,7 @@ class MainActivity : AppCompatActivity() {
         device: SpineBraceDevice?,
     ): DeviceWearUploadPackage {
         val uploadPoints = wearPointsForUpload(snapshot)
+        val fetchedAt = latestHistoryReceivedAt ?: LocalDateTime.now()
         val hourlyRows = bluetoothValidationHours(uploadPoints)
         val hourlyRowsByDate = hourlyRows.groupBy { it.hourStart.toLocalDate() }
         val records = JSONArray()
@@ -6525,7 +6933,7 @@ class MainActivity : AppCompatActivity() {
             .toSortedMap()
             .forEach { (date, points) ->
                 val wornCount = points.count { it.worn }
-                val wornHours = ((wornCount * 10f / 60f) * 10f).roundToInt() / 10f
+                val wornHours = roundOne(wornCount / 6.0)
                 val hourlyRecords = JSONArray()
                 hourlyRowsByDate[date].orEmpty().forEach { item ->
                     val samples = JSONArray()
@@ -6591,7 +6999,7 @@ class MainActivity : AppCompatActivity() {
             payload = payload,
             hourlyRows = hourlyRows,
             expectedWearPoints = uploadPoints,
-            fetchedAt = latestHistoryReceivedAt ?: LocalDateTime.now(),
+            fetchedAt = fetchedAt,
             lastReadAt = lastReadAt,
             historyHead = snapshot.header?.head,
             historyCount = snapshot.header?.count,
@@ -8194,11 +8602,18 @@ class MainActivity : AppCompatActivity() {
         private const val AUTO_CONNECT_SCAN_TIMEOUT_MS = 20_000L
         private const val BLUETOOTH_AUTO_DISCONNECT_MS = 10 * 60 * 1_000L
         private const val BLUETOOTH_AUTO_DISCONNECT_DEFER_MS = 60_000L
-        private const val DEVICE_HISTORY_INITIAL_TIMEOUT_MS = 20_000L
+        private const val DEVICE_READ_COMPLETE_DISCONNECT_DELAY_MS = 600L
+        private const val DEVICE_INITIAL_TELEMETRY_WAIT_MS = 5_000L
+        private const val DEVICE_SYNC_AFTER_TELEMETRY_DELAY_MS = 400L
+        private const val BLUETOOTH_STABILIZE_RECONNECT_DELAY_MS = 1_200L
+        private const val MAX_BLUETOOTH_CONNECT_STABILIZE_RETRIES = 3
+        private const val DEVICE_HISTORY_INITIAL_TIMEOUT_MS = 8_000L
         private const val DEVICE_HISTORY_PACKET_IDLE_TIMEOUT_MS = 30_000L
-        private const val MAX_DEVICE_HISTORY_READ_RETRIES = 0
+        private const val MAX_DEVICE_HISTORY_READ_RETRIES = 2
         private const val DEVICE_SYNC_RECONNECT_DELAY_MS = 1_500L
-        private const val MAX_DEVICE_SYNC_RECONNECT_RETRIES = 2
+        private const val MAX_DEVICE_SYNC_RECONNECT_RETRIES = 3
+        private const val DEVICE_CLEAR_WRITE_TIMEOUT_MS = 4_000L
+        private const val DEVICE_CLEAR_DISCONNECT_DELAY_MS = 800L
         private const val LOW_BATTERY_WARNING_MESSAGE = "电池电量小于20%，请更换电池"
         private const val AUTO_CONNECT_NOT_FOUND_MESSAGE = "没有发现蓝牙设备，请到设置界面扫描连接设备"
         private const val DEVICE_SYNC_INTERRUPTED_WARNING_MESSAGE = "上次数据获取未完成，设备数据已保留，请靠近设备重新连接"

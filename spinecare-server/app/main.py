@@ -290,9 +290,14 @@ def iso_wear_row(row: dict) -> dict:
                 if record
             ]
             if hourly_records:
+                hourly_records, corrections = cloud_correct_missing_ten_minute_samples(hourly_records)
                 intervals["hourly_records"] = hourly_records
                 intervals["sample_count"] = sum(int(record.get("sample_count", 0)) for record in hourly_records)
                 intervals["worn_count"] = sum(int(record.get("worn_count", 0)) for record in hourly_records)
+                if corrections:
+                    intervals["cloud_correction_version"] = 1
+                    existing_corrections = intervals.get("cloud_corrections") if isinstance(intervals.get("cloud_corrections"), list) else []
+                    intervals["cloud_corrections"] = existing_corrections + corrections
                 result["worn_hours"] = round(min(24.0, sum(float(record.get("worn_hours", 0.0)) for record in hourly_records)), 1)
                 prescribed = float(result.get("prescribed_hours") or 0)
                 if prescribed > 0:
@@ -404,6 +409,20 @@ def ten_minute_sample_slot(raw_time: str) -> str | None:
     return parsed.strftime("%Y-%m-%d %H:%M")
 
 
+def parse_sample_time(value: str) -> datetime | None:
+    normalized = value.replace("T", " ").strip()
+    if len(normalized) < 16:
+        return None
+    try:
+        return datetime.strptime(normalized[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+
+
+def format_sample_time(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M")
+
+
 def normalized_hour_record(record: dict, record_date: date) -> dict | None:
     hour_text = str(record.get("hour_start", "")).strip()
     if len(hour_text) >= 13 and hour_text[4] == "-":
@@ -433,10 +452,23 @@ def normalized_hour_record(record: dict, record_date: date) -> dict | None:
             continue
         previous = samples_by_time.get(sample_time)
         worn = bool(sample.get("worn", False))
-        samples_by_time[sample_time] = {
+        normalized_sample = {
             "recorded_at": sample_time,
             "worn": (previous["worn"] if previous else worn) and worn,
         }
+        for key in (
+            "corrected",
+            "correction_reason",
+            "correction_method",
+            "correction_source",
+            "correction_source_recorded_at",
+            "corrected_at",
+        ):
+            if sample.get(key) is not None:
+                normalized_sample[key] = sample.get(key)
+            elif previous and previous.get(key) is not None:
+                normalized_sample[key] = previous.get(key)
+        samples_by_time[sample_time] = normalized_sample
     if samples_by_time:
         samples = [samples_by_time[key] for key in sorted(samples_by_time)]
         sample_count = min(6, len(samples))
@@ -459,6 +491,82 @@ def normalized_hour_record(record: dict, record_date: date) -> dict | None:
         "worn_count": worn_count,
         "samples": samples,
     }
+
+
+def recalc_hour_record(record: dict) -> dict:
+    samples = sorted(record.get("samples") or [], key=lambda item: item.get("recorded_at", ""))
+    if samples:
+        sample_count = min(6, len(samples))
+        worn_count = min(6, sum(1 for sample in samples if sample.get("worn")))
+    else:
+        sample_count = max(0, min(6, int(record.get("sample_count", 0) or 0)))
+        worn_count = max(0, min(6, int(record.get("worn_count", 0) or 0)))
+    updated = dict(record)
+    updated["samples"] = samples
+    updated["sample_count"] = sample_count
+    updated["worn_count"] = worn_count
+    updated["worn_hours"] = round(worn_count / 6.0, 1)
+    return updated
+
+
+def cloud_correct_missing_ten_minute_samples(hourly_records: list[dict]) -> tuple[list[dict], list[dict]]:
+    records = [recalc_hour_record(record) for record in hourly_records]
+    sample_lookup: dict[str, dict] = {}
+    for record in records:
+        for sample in record.get("samples") or []:
+            recorded_at = str(sample.get("recorded_at", "")).strip()
+            if recorded_at:
+                sample_lookup[recorded_at] = sample
+
+    corrected_records: list[dict] = []
+    corrections: list[dict] = []
+    corrected_at = datetime.now(timezone.utc).isoformat()
+    for record in records:
+        samples = list(record.get("samples") or [])
+        if len(samples) != 5:
+            corrected_records.append(record)
+            continue
+        hour_start = parse_sample_time(str(record.get("hour_start", "")))
+        if hour_start is None:
+            corrected_records.append(record)
+            continue
+        expected_slots = [format_sample_time(hour_start + timedelta(minutes=10 * index)) for index in range(6)]
+        existing_slots = {str(sample.get("recorded_at", "")).strip() for sample in samples}
+        missing_slots = [slot for slot in expected_slots if slot not in existing_slots]
+        if len(missing_slots) != 1:
+            corrected_records.append(record)
+            continue
+        missing_slot = missing_slots[0]
+        previous_slot = format_sample_time(parse_sample_time(missing_slot) - timedelta(minutes=10))
+        source_sample = sample_lookup.get(previous_slot)
+        if source_sample is None:
+            corrected_records.append(record)
+            continue
+        corrected_sample = {
+            "recorded_at": missing_slot,
+            "worn": bool(source_sample.get("worn", False)),
+            "corrected": True,
+            "correction_reason": "missing_sample_at_device_read_time",
+            "correction_method": "copy_previous_10min_state",
+            "correction_source": "cloud_server",
+            "correction_source_recorded_at": previous_slot,
+            "corrected_at": corrected_at,
+        }
+        sample_lookup[missing_slot] = corrected_sample
+        corrected_record = recalc_hour_record({**record, "samples": samples + [corrected_sample]})
+        corrected_records.append(corrected_record)
+        corrections.append(
+            {
+                "hour_start": record.get("hour_start"),
+                "missing_recorded_at": missing_slot,
+                "source_recorded_at": previous_slot,
+                "worn": bool(corrected_sample["worn"]),
+                "reason": corrected_sample["correction_reason"],
+                "method": corrected_sample["correction_method"],
+                "corrected_at": corrected_at,
+            }
+        )
+    return corrected_records, corrections
 
 
 def merge_hour_record(existing: dict | None, incoming: dict) -> dict:
@@ -693,20 +801,26 @@ def sync_device_wear(payload: DeviceWearSyncRequest):
                     item.hourly_records,
                     item.date,
                 )
+            hourly_records, cloud_corrections = cloud_correct_missing_ten_minute_samples(hourly_records)
             worn_hours = round(min(24.0, sum(float(record["worn_hours"]) for record in hourly_records)), 1)
             if not hourly_records:
                 worn_hours = round(float(item.worn_hours), 1)
+            total_sample_count = sum(int(record.get("sample_count", 0)) for record in hourly_records)
+            total_worn_count = sum(int(record.get("worn_count", 0)) for record in hourly_records)
             intervals_payload = {
                 "source": "bluetooth_device",
                 "device_name": payload.device_name,
                 "device_address": payload.device_address,
-                "sample_count": item.sample_count,
-                "worn_count": item.worn_count,
+                "sample_count": total_sample_count if hourly_records else item.sample_count,
+                "worn_count": total_worn_count if hourly_records else item.worn_count,
                 "sample_interval_minutes": item.sample_interval_minutes,
                 "hourly_records": hourly_records,
                 "raw": payload.raw,
                 "merged_from_existing": bool(existing_row),
             }
+            if cloud_corrections:
+                intervals_payload["cloud_correction_version"] = 1
+                intervals_payload["cloud_corrections"] = cloud_corrections
             cur.execute(
                 """
                 INSERT INTO wear_records
